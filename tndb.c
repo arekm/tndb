@@ -327,9 +327,11 @@ int tndb_hdr_store_(struct tndb_hdr *hdr, tn_stream *st, int writeit)
 {
     int nerr = 0, size;
 
-    if (writeit)
+    if (writeit) {
+        n_assert(st != NULL);
         if (n_stream_seek(st, 0, SEEK_SET) == -1)
             return 0;
+    }
 
     size = sizeof(hdr->hdr);
 
