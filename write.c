@@ -48,6 +48,29 @@ static int st_write_hook_nowrite(const void *buf, size_t size, void *arg)
     return 0;
 }
 
+static int open_tmpfile(char *tmpath, size_t size, const char *path)
+{
+    int fd;
+
+    if (snprintf(tmpath, size, "%s.tmpXXXXXX", path) >= (int)size) {
+        errno = ENAMETOOLONG;
+        *tmpath = '\0';
+        return -1;
+    }
+
+#ifdef HAVE_MKSTEMP
+    fd = mkstemp(tmpath);
+#else
+    fd = open(tmpath, O_RDWR | O_CREAT | O_TRUNC | O_EXCL, 0600);
+#endif
+    if (fd == -1) {
+        *tmpath = '\0';
+        return -1;
+    }
+
+    return fd;
+}
+
 struct tndb *tndb_creat(const char *name, int comprlevel, unsigned flags)
 {
     char                path[PATH_MAX], mode[32] = "wb";
@@ -55,13 +78,7 @@ struct tndb *tndb_creat(const char *name, int comprlevel, unsigned flags)
     struct tndb         *db = NULL;
     int                 fd, type = TN_STREAM_STDIO;
 
-    snprintf(path, sizeof(path), "%s.tmpXXXXXX", name);
-
-#ifdef HAVE_MKSTEMP
-    fd = mkstemp(path);
-#else
-    fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_EXCL, 0600);
-#endif
+    fd = open_tmpfile(path, sizeof(path), name);
     if (fd < 0)
         return NULL;
 
@@ -264,25 +281,59 @@ static int htt_compute_digest(struct tndb *db)
     return rc;
 }
 
+/* what the new file gets: the mode and owner of the one it replaces, or
+   what open(..., 0666) would have given a new one.  fchown() to another
+   user needs privileges, so it is best effort: the file stays the
+   writer's. */
+static int setperms(int fd, const char *src)
+{
+    struct stat st;
+    mode_t mask;
+
+    if (stat(src, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (fchown(fd, st.st_uid, st.st_gid) != 0 && errno != EPERM)
+            return 0;
+
+        /* chown() clears them; neither setuid nor setgid is kept anyway */
+        return fchmod(fd, st.st_mode & 0777) == 0;
+    }
+
+    /* a new file; umask() is process-wide, and the writer of a database
+       does not create unrelated files at the same time */
+    mask = umask(0);
+    umask(mask);
+
+    return fchmod(fd, 0666 & ~mask) == 0;
+}
+
 static int tndbw_close(struct tndb *db)
 {
     ssize_t nread;
-    char   buf[1024 * 16];
+    char   buf[1024 * 16], tmpath[PATH_MAX + 16];
     int    fdin = -1, fdout = -1, type, rc;
 
     rc = 0;
+    tmpath[0] = '\0';
     n_assert(db->rtflags & TNDB_R_MODE_W);
 
-    n_stream_flush(db->st);
+    if (n_stream_flush(db->st) != 0)
+        goto l_end;
     type = db->st->type;
 
     if ((fdin = dup(db->st->fd)) == -1)
         goto l_end;
 
-    n_stream_close(db->st);
+    /* the trailer belongs to the body: a failure here cuts it */
+    if (n_stream_close(db->st) != 0) {
+        db->st = NULL;
+        goto l_end;
+    }
     db->st = NULL;
 
-    if ((fdout = open(db->path, O_RDWR | O_CREAT | O_TRUNC, 0666)) == -1)
+    if ((fdout = open_tmpfile(tmpath, sizeof(tmpath), db->path)) == -1)
+        goto l_end;
+
+    if (!setperms(fdout, db->path))
         goto l_end;
 
     if ((db->st = n_stream_dopen(fdout, "wb", type)) == NULL)
@@ -312,11 +363,16 @@ static int tndbw_close(struct tndb *db)
             goto l_end;
     }
 
-    n_stream_flush(db->st);
+    if (n_stream_flush(db->st) != 0)
+        goto l_end;
+
     if ((fdout = dup(db->st->fd)) == -1)
         goto l_end;
 
-    n_stream_close(db->st);
+    if (n_stream_close(db->st) != 0) {
+        db->st = NULL;
+        goto l_end;
+    }
     db->st = NULL;
 
     if (lseek(fdin, 0, SEEK_SET) == -1)
@@ -330,8 +386,19 @@ static int tndbw_close(struct tndb *db)
             goto l_end;
     }
 
-    if (nread != -1)
-        rc = 1;
+    if (nread == -1)
+        goto l_end;
+
+    if (close(fdout) != 0) {    /* the body is on disk now or never */
+        fdout = -1;
+        goto l_end;
+    }
+    fdout = -1;
+
+    if (rename(tmpath, db->path) != 0)
+        goto l_end;
+
+    rc = 1;
 
  l_end:
     tndb_free(db);
@@ -341,6 +408,9 @@ static int tndbw_close(struct tndb *db)
 
     if (fdout >= 0)
         close(fdout);
+
+    if (!rc && tmpath[0])
+        unlink(tmpath);
 
     return rc;
 }
