@@ -14,6 +14,7 @@
 # include "config.h"
 #endif
 
+#include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -333,9 +334,6 @@ static int tndbw_close(struct tndb *db)
     if ((fdout = open_tmpfile(tmpath, sizeof(tmpath), db->path)) == -1)
         goto l_end;
 
-    if (!setperms(fdout, db->path))
-        goto l_end;
-
     if ((db->st = n_stream_dopen(fdout, "wb", type)) == NULL)
         goto l_end;
     fdout = -1;                 /* closed with db->st */
@@ -387,6 +385,11 @@ static int tndbw_close(struct tndb *db)
     }
 
     if (nread == -1)
+        goto l_end;
+
+    /* written 0600 and owned by the writer until now; the rename() is what
+       makes the file visible with these */
+    if (!setperms(fdout, db->path))
         goto l_end;
 
     if (close(fdout) != 0) {    /* the body is on disk now or never */
