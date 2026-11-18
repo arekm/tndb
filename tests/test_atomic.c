@@ -44,7 +44,8 @@ int __wrap_rename(const char *oldpath, const char *newpath)
     return __real_rename(oldpath, newpath);
 }
 
-/* 0 real, 1 always ENOSYS, 2 a part then ENOSYS, 3 a part then EIO */
+/* 0 real, 1 always ENOSYS, 2 a part then ENOSYS, 3 a part then EIO,
+   4 always EPERM (a seccomp filter that does not know the syscall) */
 static int cfr_mode;
 static int cfr_calls;
 
@@ -55,8 +56,8 @@ ssize_t __real_copy_file_range(int fd_in, loff_t *off_in, int fd_out,
 ssize_t __wrap_copy_file_range(int fd_in, loff_t *off_in, int fd_out,
                                loff_t *off_out, size_t len, unsigned int flags)
 {
-    if (cfr_mode == 1) {
-        errno = ENOSYS;
+    if (cfr_mode == 1 || cfr_mode == 4) {
+        errno = cfr_mode == 1 ? ENOSYS : EPERM;
         return -1;
     }
 
@@ -658,22 +659,23 @@ START_TEST(test_atomic_close_failure)
 END_TEST
 
 #ifdef HAVE_COPY_FILE_RANGE
-# define CFR_MODES 2          /* unusable, and a part then unusable */
+/* unusable, refused, and a part then unusable */
+static const int cfr_modes[] = { 1, 4, 2 };
 #else
-# define CFR_MODES 1
+static const int cfr_modes[] = { 1 };
 #endif
+#define CFR_MODES (int)(sizeof(cfr_modes) / sizeof(cfr_modes[0]))
 
-/* the body appended by read/write, when copy_file_range() is unusable or
-   stops half way, is the same database; the last round (mode 0, read/write
-   only without copy_file_range(), else mode 1) has short and interrupted
-   writes */
+/* the body appended by read/write, when copy_file_range() is unusable,
+   refused or stops half way, is the same database; the last round (mode 1)
+   has short and interrupted writes */
 START_TEST(test_atomic_copy_fallback)
 {
     const char *path = NTEST_TMPPATH("tndb-atomic-copy.db");
     size_t len = 64 * 1024;
     char *val, *got;
     struct tndb *db;
-    int mode, n;
+    int i, mode, n;
 
     val = malloc(len);
     got = malloc(len + 1);
@@ -682,12 +684,12 @@ START_TEST(test_atomic_copy_fallback)
     for (size_t i = 0; i < len; i++)
         val[i] = (char)('a' + (i % 26));
 
-    for (mode = 1; mode <= CFR_MODES + 1; mode++) {
+    for (i = 0; i <= CFR_MODES; i++) {
         unlink_db(path);
 
-        short_writes = mode > CFR_MODES;
+        short_writes = i == CFR_MODES;
         write_calls = 0;
-        cfr_mode = short_writes ? 1 : mode;
+        mode = cfr_mode = short_writes ? 1 : cfr_modes[i];
         cfr_calls = 0;
 
         db = tndb_creat(path, -1, TNDB_SIGN_DIGEST);

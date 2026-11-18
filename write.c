@@ -428,9 +428,11 @@ static int append_body(int fdin, int fdout)
             if (errno == EINTR)
                 continue;
 
-            /* no kernel copy here; read/write from where it stopped */
+            /* no kernel copy here; read/write from where it stopped.  EPERM
+               is what an older seccomp filter gives for a syscall it does
+               not know; a real one comes back from write() */
             if (errno == ENOSYS || errno == EXDEV || errno == EINVAL ||
-                errno == EOPNOTSUPP)
+                errno == EOPNOTSUPP || errno == EPERM)
                 break;
 
             return -1;
