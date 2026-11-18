@@ -1,8 +1,9 @@
 /* the database is written as the hidden .<name>.tmp.XXXXXX next to it and
    renamed into place by tndb_close(): a failed close leaves an existing
    file as it was, and a new file gets the mode (and, with the privileges,
-   the owner) of the old one.  rename(), n_stream_close() and
-   copy_file_range() are wrapped to fail on demand. */
+   the owner) of the old one.  rename(), n_stream_close(), copy_file_range(),
+   write(), close() and fchown() are wrapped to fail on demand, and so is
+   n_stream_dopen(), to make a stream's flush fail. */
 #define _GNU_SOURCE 1           /* copy_file_range(), loff_t */
 
 #ifdef HAVE_CONFIG_H
@@ -23,13 +24,18 @@
 #include "tndb.h"
 
 static int rename_fails;
+static char renamed_from[PATH_MAX];
 static int close_calls, close_fail_at;
+static int dopen_calls, flush_fail_at;
 
 int __real_rename(const char *oldpath, const char *newpath);
 int __real_n_stream_close(tn_stream *st);
+tn_stream *__real_n_stream_dopen(int fd, const char *mode, int type);
 
 int __wrap_rename(const char *oldpath, const char *newpath)
 {
+    snprintf(renamed_from, sizeof(renamed_from), "%s", oldpath);
+
     if (rename_fails) {
         errno = ENOSPC;
         return -1;
@@ -38,7 +44,8 @@ int __wrap_rename(const char *oldpath, const char *newpath)
     return __real_rename(oldpath, newpath);
 }
 
-static int cfr_mode;            /* 0 real, 1 always ENOSYS, 2 a part then ENOSYS */
+/* 0 real, 1 always ENOSYS, 2 a part then ENOSYS, 3 a part then EIO */
+static int cfr_mode;
 static int cfr_calls;
 
 #ifdef HAVE_COPY_FILE_RANGE
@@ -53,11 +60,11 @@ ssize_t __wrap_copy_file_range(int fd_in, loff_t *off_in, int fd_out,
         return -1;
     }
 
-    if (cfr_mode == 2) {
+    if (cfr_mode == 2 || cfr_mode == 3) {
         if (++cfr_calls == 1)
             return __real_copy_file_range(fd_in, off_in, fd_out, off_out,
                                           4096 < len ? 4096 : len, flags);
-        errno = ENOSYS;
+        errno = cfr_mode == 2 ? ENOSYS : EIO;
         return -1;
     }
 
@@ -76,6 +83,92 @@ int __wrap_n_stream_close(tn_stream *st)
     }
 
     return rc;
+}
+
+/* n_stream_flush() is inline, so the stream's own flush is the one
+   replaced: of the flush_fail_at'th stream opened, 1 the body, 2 the
+   header */
+static int (*real_st_flush)(void *);
+static int flush_failed;
+
+static int failing_st_flush(void *stream)
+{
+    real_st_flush(stream);
+    flush_failed++;
+    errno = EIO;
+    return EOF;
+}
+
+tn_stream *__wrap_n_stream_dopen(int fd, const char *mode, int type)
+{
+    tn_stream *st = __real_n_stream_dopen(fd, mode, type);
+
+    if (st != NULL && ++dopen_calls == flush_fail_at) {
+        real_st_flush = st->st_flush;
+        st->st_flush = failing_st_flush;
+    }
+
+    return st;
+}
+
+/* the read/write fallback: an EINTR first, then at most 1000 bytes a call */
+static int short_writes, write_calls;
+
+ssize_t __real_write(int fd, const void *buf, size_t len);
+
+ssize_t __wrap_write(int fd, const void *buf, size_t len)
+{
+    if (short_writes) {
+        if (write_calls++ == 0) {
+            errno = EINTR;
+            return -1;
+        }
+
+        if (len > 1000)
+            len = 1000;
+    }
+
+    return __real_write(fd, buf, len);
+}
+
+/* fails the close of the final temp, the one fd tndb closes while the file
+   still has a name (the body temp is unlinked at once); the fd is closed
+   anyway, as on Linux */
+static int close_named_fails;
+
+int __real_close(int fd);
+
+int __wrap_close(int fd)
+{
+    struct stat sb;
+
+    if (close_named_fails && fstat(fd, &sb) == 0 && sb.st_nlink > 0) {
+        __real_close(fd);
+        errno = EIO;
+        return -1;
+    }
+
+    return __real_close(fd);
+}
+
+static int fchown_calls, fchown_errno;
+static uid_t fchown_uid;
+static gid_t fchown_gid;
+
+int __real_fchown(int fd, uid_t uid, gid_t gid);
+
+int __wrap_fchown(int fd, uid_t uid, gid_t gid)
+{
+    fchown_calls++;
+    fchown_uid = uid;
+    fchown_gid = gid;
+
+    if (fchown_errno) {
+        errno = fchown_errno;
+        return -1;
+    }
+
+    return __real_fchown(fd, uid, gid);
 }
 
 /* <dir>/.<name>.tmp.XXXXXX; keep in sync with open_tmpfile() */
@@ -125,14 +218,41 @@ static void expect_db(const char *path, const char *val)
     expect_int(tndb_close(db), 1);
 }
 
+/* a rewrite of path with "new" fails in tndb_close(), and leaves "old" */
+static void expect_failed_rewrite(const char *path)
+{
+    struct tndb *db;
+
+    db = tndb_creat(path, -1, TNDB_SIGN_DIGEST);
+    fail_if(db == NULL, "cannot create %s", path);
+    expect_int(tndb_put(db, "key", 3, "new", 3), 1);
+    expect_int(tndb_close(db), 0);
+}
+
+/* the file renamed into place is the hidden temp next to path */
 START_TEST(test_atomic_write)
 {
     const char *path = NTEST_TMPPATH("tndb-atomic.db");
+    const char *base = strrchr(path, '/') + 1;
+    const char *from;
+    char prefix[PATH_MAX];
 
     unlink(path);
+    renamed_from[0] = '\0';
     write_db(path, "first");
     expect_db(path, "first");
     expect_int(tmp_files(path), 0);
+
+    from = strrchr(renamed_from, '/');
+    fail_if(from == NULL, "nothing renamed into %s", path);
+    expect_int((int)(from - renamed_from), (int)(base - 1 - path));
+    fail_if(strncmp(renamed_from, path, base - path) != 0,
+            "%s is not next to %s", renamed_from, path);
+
+    snprintf(prefix, sizeof(prefix), ".%s.tmp.", base);
+    fail_if(strncmp(from + 1, prefix, strlen(prefix)) != 0,
+            "%s is not %sXXXXXX", from + 1, prefix);
+    expect_int((int)strlen(from + 1), (int)strlen(prefix) + 6);
     unlink(path);
 }
 END_TEST
@@ -164,6 +284,51 @@ START_TEST(test_atomic_mode)
 }
 END_TEST
 
+/* both flushes of the writer, the body's and the header's, and the close()
+   of the final temp */
+START_TEST(test_atomic_flush_failure)
+{
+    const char *path = NTEST_TMPPATH("tndb-atomic-flush.db");
+    int n;
+
+    for (n = 1; n <= 2; n++) {
+        unlink(path);
+        write_db(path, "old");
+
+        dopen_calls = flush_failed = 0;
+        flush_fail_at = n;
+        expect_failed_rewrite(path);
+        flush_fail_at = 0;
+        expect_int(flush_failed, 1);
+
+        expect_db(path, "old");
+        expect_int(tmp_files(path), 0);
+    }
+    unlink(path);
+}
+END_TEST
+
+START_TEST(test_atomic_fdclose_failure)
+{
+    const char *path = NTEST_TMPPATH("tndb-atomic-fdclose.db");
+    struct tndb *db;
+
+    unlink(path);
+    write_db(path, "old");
+
+    db = tndb_creat(path, -1, TNDB_SIGN_DIGEST);
+    fail_if(db == NULL, "cannot create %s", path);
+    expect_int(tndb_put(db, "key", 3, "new", 3), 1);
+    close_named_fails = 1;
+    expect_int(tndb_close(db), 0);
+    close_named_fails = 0;
+
+    expect_db(path, "old");
+    expect_int(tmp_files(path), 0);
+    unlink(path);
+}
+END_TEST
+
 START_TEST(test_atomic_rename_failure)
 {
     const char *path = NTEST_TMPPATH("tndb-atomic-rename.db");
@@ -181,6 +346,74 @@ START_TEST(test_atomic_rename_failure)
 
     expect_db(path, "old");
     expect_int(tmp_files(path), 0);
+    unlink(path);
+}
+END_TEST
+
+/* the owner and group of a replaced file are passed to fchown(); a refused
+   fchown() (EPERM, another user's file) still writes, any other error does
+   not */
+START_TEST(test_atomic_owner)
+{
+    const char *path = NTEST_TMPPATH("tndb-atomic-owner.db");
+    struct stat sb;
+
+    unlink(path);
+    fchown_calls = 0;
+    write_db(path, "old");
+    expect_int(fchown_calls, 0);        /* a new file is the writer's */
+
+    fail_if(stat(path, &sb) != 0, "cannot stat %s", path);
+    write_db(path, "newer");
+    expect_int(fchown_calls, 1);
+    expect_int((int)fchown_uid, (int)sb.st_uid);
+    expect_int((int)fchown_gid, (int)sb.st_gid);
+
+    fchown_errno = EPERM;
+    write_db(path, "newest");
+    expect_db(path, "newest");
+
+    unlink(path);
+    write_db(path, "old");
+    fchown_errno = EIO;
+    expect_failed_rewrite(path);
+    fchown_errno = 0;
+
+    expect_db(path, "old");
+    expect_int(tmp_files(path), 0);
+    unlink(path);
+}
+END_TEST
+
+/* the real thing: a file chgrp'ed to another group of the writer keeps it */
+START_TEST(test_atomic_group)
+{
+    const char *path = NTEST_TMPPATH("tndb-atomic-group.db");
+    gid_t groups[NGROUPS_MAX], gid = (gid_t)-1;
+    struct stat sb;
+    int i, n;
+
+    n = getgroups(NGROUPS_MAX, groups);
+    for (i = 0; i < n; i++) {
+        if (groups[i] != getegid()) {
+            gid = groups[i];
+            break;
+        }
+    }
+
+    if (gid == (gid_t)-1) {
+        NTEST_LOG("skipped: no supplementary group\n");
+        return;
+    }
+
+    unlink(path);
+    write_db(path, "old");
+    fail_if(chown(path, (uid_t)-1, gid) != 0, "cannot chgrp %s", path);
+    write_db(path, "new");
+    expect_db(path, "new");
+
+    fail_if(stat(path, &sb) != 0, "cannot stat %s", path);
+    expect_int((int)sb.st_gid, (int)gid);
     unlink(path);
 }
 END_TEST
@@ -218,7 +451,9 @@ END_TEST
 #endif
 
 /* the body appended by read/write, when copy_file_range() is unusable or
-   stops half way, is the same database */
+   stops half way, is the same database; the last round (mode 0, read/write
+   only without copy_file_range(), else mode 1) has short and interrupted
+   writes */
 START_TEST(test_atomic_copy_fallback)
 {
     const char *path = NTEST_TMPPATH("tndb-atomic-copy.db");
@@ -234,10 +469,12 @@ START_TEST(test_atomic_copy_fallback)
     for (size_t i = 0; i < len; i++)
         val[i] = (char)('a' + (i % 26));
 
-    for (mode = 1; mode <= CFR_MODES; mode++) {
+    for (mode = 1; mode <= CFR_MODES + 1; mode++) {
         unlink(path);
 
-        cfr_mode = mode;
+        short_writes = mode > CFR_MODES;
+        write_calls = 0;
+        cfr_mode = short_writes ? 1 : mode;
         cfr_calls = 0;
 
         db = tndb_creat(path, -1, TNDB_SIGN_DIGEST);
@@ -246,6 +483,10 @@ START_TEST(test_atomic_copy_fallback)
         expect_int(tndb_close(db), 1);
 
         cfr_mode = 0;
+        if (short_writes) {
+            short_writes = 0;
+            fail_if(write_calls < 3, "no short writes (%d)", write_calls);
+        }
 
         db = tndb_open(path);
         fail_if(db == NULL, "cannot open %s", path);
@@ -262,9 +503,48 @@ START_TEST(test_atomic_copy_fallback)
 }
 END_TEST
 
+/* a real error of copy_file_range() is not a reason to fall back: the
+   close fails and the old file stays */
+START_TEST(test_atomic_copy_failure)
+{
+#ifdef HAVE_COPY_FILE_RANGE
+    const char *path = NTEST_TMPPATH("tndb-atomic-copyerr.db");
+    size_t len = 64 * 1024;
+    struct tndb *db;
+    char *val;
+
+    val = malloc(len);
+    fail_if(val == NULL, "out of memory");
+    memset(val, 'x', len);
+
+    unlink(path);
+    write_db(path, "old");
+
+    cfr_mode = 3;
+    cfr_calls = 0;
+    db = tndb_creat(path, -1, TNDB_SIGN_DIGEST);
+    fail_if(db == NULL, "cannot create %s", path);
+    expect_int(tndb_put(db, "big", 3, val, len), 1);
+    expect_int(tndb_close(db), 0);
+    cfr_mode = 0;
+    expect_int(cfr_calls, 2);
+
+    expect_db(path, "old");
+    expect_int(tmp_files(path), 0);
+    unlink(path);
+    free(val);
+#endif
+}
+END_TEST
+
 NTEST_RUNNER("tndb-atomic",
              test_atomic_write,
              test_atomic_mode,
+             test_atomic_owner,
+             test_atomic_group,
+             test_atomic_flush_failure,
+             test_atomic_fdclose_failure,
              test_atomic_rename_failure,
              test_atomic_close_failure,
+             test_atomic_copy_failure,
              test_atomic_copy_fallback);

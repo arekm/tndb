@@ -12,7 +12,8 @@ test_dopen_failure_LDADD = $(top_builddir)/.libs/libtndb.a @LIBS@
 test_dopen_failure_DEPENDENCIES = $(top_builddir)/libtndb.la
 
 test_atomic_LDFLAGS = -Wl,--wrap=rename -Wl,--wrap=n_stream_close \
-	-Wl,--wrap=copy_file_range \
+	-Wl,--wrap=n_stream_dopen -Wl,--wrap=copy_file_range \
+	-Wl,--wrap=write -Wl,--wrap=close -Wl,--wrap=fchown \
 	-Wl,-rpath,$(abs_top_builddir)/../trurlib/.libs
 test_atomic_LDADD = $(top_builddir)/.libs/libtndb.a @LIBS@ @CHECK_LIBS@
 test_atomic_DEPENDENCIES = $(top_builddir)/libtndb.la
