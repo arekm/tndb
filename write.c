@@ -14,6 +14,13 @@
 # include "config.h"
 #endif
 
+#ifdef HAVE_COPY_FILE_RANGE
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE 1 /* copy_file_range() is declared only with _GNU_SOURCE */
+#endif
+#define COPY_CHUNK_MAX 0x7ffff000 /* the most one copy_file_range() call moves */
+#endif
+
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -23,7 +30,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-
 
 #include <trurl/nmalloc.h>
 #include <trurl/narray.h>
@@ -315,10 +321,80 @@ static int setperms(int fd, const char *src)
     return fchmod(fd, 0666 & ~mask) == 0;
 }
 
+/* copies the whole fdin, from offset 0, to the end of fdout */
+static int append_body(int fdin, int fdout)
+{
+    off_t in_off = 0;
+
+    if (lseek(fdout, 0, SEEK_END) == -1)
+        return -1;
+
+#ifdef HAVE_COPY_FILE_RANGE
+    for (;;) {
+        ssize_t n;
+
+        n = copy_file_range(fdin, &in_off, fdout, NULL, COPY_CHUNK_MAX, 0);
+        if (n == 0)             /* EOF */
+            return 0;
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+
+            /* no kernel copy here; read/write from where it stopped */
+            if (errno == ENOSYS || errno == EXDEV || errno == EINVAL ||
+                errno == EOPNOTSUPP)
+                break;
+
+            return -1;
+        }
+    }
+#endif
+
+    if (lseek(fdin, in_off, SEEK_SET) == -1)
+        return -1;
+
+    {
+        char buf[1024 * 16];
+        ssize_t nread;
+
+        while ((nread = read(fdin, buf, sizeof(buf))) != 0) {
+            ssize_t nwritten = 0;
+
+            if (nread < 0) {
+                if (errno == EINTR)
+                    continue;
+                return -1;
+            }
+
+            while (nwritten < nread) {
+                ssize_t n;
+
+                n = write(fdout, buf + nwritten,
+                          (size_t)(nread - nwritten));
+                if (n < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    return -1;
+                }
+
+                if (n == 0) {
+                    errno = EIO;
+                    return -1;
+                }
+
+                nwritten += n;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
 static int tndbw_close(struct tndb *db)
 {
-    ssize_t nread;
-    char   buf[1024 * 16], tmpath[PATH_MAX + 16];
+    char   tmpath[PATH_MAX + 16];
     int    fdin = -1, fdout = -1, type, rc;
 
     rc = 0;
@@ -381,18 +457,7 @@ static int tndbw_close(struct tndb *db)
     }
     db->st = NULL;
 
-    if (lseek(fdin, 0, SEEK_SET) == -1)
-        goto l_end;
-
-    if (lseek(fdout, 0, SEEK_END) == -1)
-        goto l_end;
-
-    while ((nread = read(fdin, buf, sizeof(buf))) > 0) {
-        if (write(fdout, buf, nread) != (int)nread)
-            goto l_end;
-    }
-
-    if (nread == -1)
+    if (append_body(fdin, fdout) != 0)
         goto l_end;
 
     /* written 0600 and owned by the writer until now; the rename() is what

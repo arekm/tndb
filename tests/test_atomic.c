@@ -1,8 +1,10 @@
 /* the database is written as the hidden .<name>.tmp.XXXXXX next to it and
    renamed into place by tndb_close(): a failed close leaves an existing
    file as it was, and a new file gets the mode (and, with the privileges,
-   the owner) of the old one.  rename() and n_stream_close() are wrapped to
-   fail on demand. */
+   the owner) of the old one.  rename(), n_stream_close() and
+   copy_file_range() are wrapped to fail on demand. */
+#define _GNU_SOURCE 1           /* copy_file_range(), loff_t */
+
 #ifdef HAVE_CONFIG_H
 # include "config.h"
 #endif
@@ -11,6 +13,7 @@
 #include <glob.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -35,6 +38,33 @@ int __wrap_rename(const char *oldpath, const char *newpath)
     return __real_rename(oldpath, newpath);
 }
 
+static int cfr_mode;            /* 0 real, 1 always ENOSYS, 2 a part then ENOSYS */
+static int cfr_calls;
+
+#ifdef HAVE_COPY_FILE_RANGE
+ssize_t __real_copy_file_range(int fd_in, loff_t *off_in, int fd_out,
+                               loff_t *off_out, size_t len, unsigned int flags);
+
+ssize_t __wrap_copy_file_range(int fd_in, loff_t *off_in, int fd_out,
+                               loff_t *off_out, size_t len, unsigned int flags)
+{
+    if (cfr_mode == 1) {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    if (cfr_mode == 2) {
+        if (++cfr_calls == 1)
+            return __real_copy_file_range(fd_in, off_in, fd_out, off_out,
+                                          4096 < len ? 4096 : len, flags);
+        errno = ENOSYS;
+        return -1;
+    }
+
+    return __real_copy_file_range(fd_in, off_in, fd_out, off_out, len, flags);
+}
+#endif
+
 int __wrap_n_stream_close(tn_stream *st)
 {
     int rc = __real_n_stream_close(st);
@@ -48,6 +78,7 @@ int __wrap_n_stream_close(tn_stream *st)
     return rc;
 }
 
+/* <dir>/.<name>.tmp.XXXXXX; keep in sync with open_tmpfile() */
 static int tmp_files(const char *path)
 {
     char pattern[PATH_MAX + 16];
@@ -180,8 +211,60 @@ START_TEST(test_atomic_close_failure)
 }
 END_TEST
 
+#ifdef HAVE_COPY_FILE_RANGE
+# define CFR_MODES 2          /* unusable, and a part then unusable */
+#else
+# define CFR_MODES 1
+#endif
+
+/* the body appended by read/write, when copy_file_range() is unusable or
+   stops half way, is the same database */
+START_TEST(test_atomic_copy_fallback)
+{
+    const char *path = NTEST_TMPPATH("tndb-atomic-copy.db");
+    size_t len = 64 * 1024;
+    char *val, *got;
+    struct tndb *db;
+    int mode, n;
+
+    val = malloc(len);
+    got = malloc(len + 1);
+    fail_if(val == NULL || got == NULL, "out of memory");
+
+    for (size_t i = 0; i < len; i++)
+        val[i] = (char)('a' + (i % 26));
+
+    for (mode = 1; mode <= CFR_MODES; mode++) {
+        unlink(path);
+
+        cfr_mode = mode;
+        cfr_calls = 0;
+
+        db = tndb_creat(path, -1, TNDB_SIGN_DIGEST);
+        fail_if(db == NULL, "cannot create %s", path);
+        expect_int(tndb_put(db, "big", 3, val, len), 1);
+        expect_int(tndb_close(db), 1);
+
+        cfr_mode = 0;
+
+        db = tndb_open(path);
+        fail_if(db == NULL, "cannot open %s", path);
+        expect_int(tndb_verify(db), 1);
+        n = tndb_get(db, "big", 3, got, len + 1);
+        expect_int(n, (int)len);
+        fail_if(memcmp(got, val, len) != 0, "value differs (mode %d)", mode);
+        expect_int(tndb_close(db), 1);
+    }
+
+    unlink(path);
+    free(val);
+    free(got);
+}
+END_TEST
+
 NTEST_RUNNER("tndb-atomic",
              test_atomic_write,
              test_atomic_mode,
              test_atomic_rename_failure,
-             test_atomic_close_failure);
+             test_atomic_close_failure,
+             test_atomic_copy_fallback);
