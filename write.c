@@ -34,6 +34,7 @@
 #include <trurl/nmalloc.h>
 #include <trurl/narray.h>
 #include <trurl/nassert.h>
+#include <trurl/natomic.h>
 
 #define TN_STREAM_USE_GZIO_NG 1
 #include "compiler.h"
@@ -55,7 +56,8 @@ static int st_write_hook_nowrite(const void *buf, size_t size, void *arg)
     return 0;
 }
 
-/* <dir>/.<name>.tmp.XXXXXX */
+/* <dir>/.<name>.tmp.XXXXXX, close-on-exec: it is open for the whole build
+   of the database, and a child forked meanwhile must not keep it */
 static int open_tmpfile(char *tmpath, size_t size, const char *path)
 {
     const char *base = strrchr(path, '/');
@@ -83,60 +85,17 @@ static int open_tmpfile(char *tmpath, size_t size, const char *path)
         return -1;
     }
 
-    return fd;
-}
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+        int err = errno;
 
-#define SYMLINKS_MAX 40         /* Linux's MAXSYMLINKS */
-
-/* the file a write to path ends up in, as open(..., O_CREAT) would find
-   it: the symlinks of the last component followed, a dangling one to its
-   (new) target; the directories are left as they are, rename() works
-   through them */
-static int resolve_target(const char *path, char *out, size_t size)
-{
-    char        link[PATH_MAX], tmp[PATH_MAX];
-    struct stat st;
-    const char  *slash;
-    ssize_t     len;
-    int         n, depth;
-
-    if ((size_t)snprintf(out, size, "%s", path) >= size)
-        goto l_toolong;
-
-    for (depth = 0; depth < SYMLINKS_MAX; depth++) {
-        if (lstat(out, &st) != 0)
-            return errno == ENOENT ? 0 : -1; /* a new file */
-
-        if (!S_ISLNK(st.st_mode))
-            return 0;
-
-        if ((len = readlink(out, link, sizeof(link))) == -1)
-            return -1;
-
-        if ((size_t)len >= sizeof(link)) /* cut */
-            goto l_toolong;
-        link[len] = '\0';
-
-        /* a relative target is relative to the link's directory */
-        slash = strrchr(out, '/');
-        if (link[0] == '/' || slash == NULL)
-            n = snprintf(tmp, sizeof(tmp), "%s", link);
-        else
-            n = snprintf(tmp, sizeof(tmp), "%.*s%s",
-                         (int)(slash - out + 1), out, link);
-
-        if (n < 0 || (size_t)n >= sizeof(tmp) || (size_t)n >= size)
-            goto l_toolong;
-
-        memcpy(out, tmp, (size_t)n + 1);
+        close(fd);
+        unlink(tmpath);
+        *tmpath = '\0';
+        errno = err;
+        return -1;
     }
 
-    errno = ELOOP;
-    return -1;
-
- l_toolong:
-    errno = ENAMETOOLONG;
-    return -1;
+    return fd;
 }
 
 struct tndb *tndb_creat(const char *name, int comprlevel, unsigned flags)
@@ -349,65 +308,6 @@ static int htt_compute_digest(struct tndb *db)
     return rc;
 }
 
-/* what the new file gets: the mode and owner of the one it replaces, or
-   what open(..., 0666) would have given a new one.  fchown() to another
-   user needs privileges, so it is best effort: the file stays the
-   writer's. */
-static int setperms(int fd, const char *src)
-{
-    struct stat st;
-    mode_t mask;
-
-    if (stat(src, &st) == 0 && S_ISREG(st.st_mode)) {
-        if (fchown(fd, st.st_uid, st.st_gid) != 0 && errno != EPERM)
-            return 0;
-
-        /* chown() clears them; neither setuid nor setgid is kept anyway */
-        return fchmod(fd, st.st_mode & 0777) == 0;
-    }
-
-    /* a new file; umask() is process-wide, and the writer of a database
-       does not create unrelated files at the same time */
-    mask = umask(0);
-    umask(mask);
-
-    return fchmod(fd, 0666 & ~mask) == 0;
-}
-
-static int fsync_retry(int fd)
-{
-    int rc;
-
-    while ((rc = fsync(fd)) != 0 && errno == EINTR)
-        ;
-    return rc;
-}
-
-/* without it a crash can keep the old name pointing at the old file; a
-   filesystem that cannot sync a directory (EINVAL) does not need to */
-static int sync_dir(const char *path)
-{
-    char        dir[PATH_MAX];
-    const char  *slash = strrchr(path, '/');
-    int         fd, rc = 0;
-
-    if (slash == NULL)
-        snprintf(dir, sizeof(dir), ".");
-    else if (slash == path)
-        snprintf(dir, sizeof(dir), "/");
-    else
-        snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
-
-    if ((fd = open(dir, O_RDONLY | O_DIRECTORY)) == -1)
-        return -1;
-
-    if (fsync_retry(fd) != 0 && errno != EINVAL && errno != ENOTSUP)
-        rc = -1;
-
-    close(fd);
-    return rc;
-}
-
 /* copies the whole fdin, from offset 0, to the end of fdout */
 static int append_body(int fdin, int fdout)
 {
@@ -483,18 +383,17 @@ static int append_body(int fdin, int fdout)
 
 static int tndbw_close(struct tndb *db)
 {
-    char   tmpath[PATH_MAX + 16], target[PATH_MAX];
-    int    fdin = -1, fdout = -1, type, rc;
+    tn_atomic *af = NULL;
+    int    fdin = -1, fdout, type, rc;
 
     rc = 0;
-    tmpath[0] = '\0';
     n_assert(db->rtflags & TNDB_R_MODE_W);
 
     if (n_stream_flush(db->st) != 0)
         goto l_end;
     type = db->st->type;
 
-    if ((fdin = dup(db->st->fd)) == -1)
+    if ((fdin = fcntl(db->st->fd, F_DUPFD_CLOEXEC, 0)) == -1)
         goto l_end;
 
     /* the trailer belongs to the body: a failure here cuts it */
@@ -504,16 +403,20 @@ static int tndbw_close(struct tndb *db)
     }
     db->st = NULL;
 
-    /* through a symlink the target is replaced, not the link */
-    if (resolve_target(db->path, target, sizeof(target)) != 0)
+    /* the header, the hash table and the body go to a temporary file that
+       the commit renames into place; synced, so that a crash leaves either
+       the old database or the new one */
+    if ((af = n_atomic_open(db->path, TN_ATOMIC_SYNC)) == NULL)
         goto l_end;
 
-    if ((fdout = open_tmpfile(tmpath, sizeof(tmpath), target)) == -1)
+    /* the stream closes its own descriptor, the commit closes af's */
+    if ((fdout = fcntl(n_atomic_fd(af), F_DUPFD_CLOEXEC, 0)) == -1)
         goto l_end;
 
-    if ((db->st = n_stream_dopen(fdout, "wb", type)) == NULL)
+    if ((db->st = n_stream_dopen(fdout, "wb", type)) == NULL) {
+        close(fdout);
         goto l_end;
-    fdout = -1;                 /* closed with db->st */
+    }
 
     db->hdr.doffs = tndb_hdr_store_sizeof(&db->hdr) + htt_store_size(db);
     //printf("headers = %d\n", db->hdr.doffs);
@@ -541,41 +444,18 @@ static int tndbw_close(struct tndb *db)
     if (n_stream_flush(db->st) != 0)
         goto l_end;
 
-    if ((fdout = dup(db->st->fd)) == -1)
-        goto l_end;
-
     if (n_stream_close(db->st) != 0) {
         db->st = NULL;
         goto l_end;
     }
     db->st = NULL;
 
-    if (append_body(fdin, fdout) != 0)
+    if (append_body(fdin, n_atomic_fd(af)) != 0)
         goto l_end;
 
-    /* written 0600 and owned by the writer until now; the rename() is what
-       makes the file visible with these */
-    if (!setperms(fdout, target))
-        goto l_end;
-
-    /* a crash after the rename() must not find a cut file under the name */
-    if (fsync_retry(fdout) != 0)
-        goto l_end;
-
-    if (close(fdout) != 0) {    /* the body is on disk now or never */
-        fdout = -1;
-        goto l_end;
-    }
-    fdout = -1;
-
-    if (rename(tmpath, target) != 0)
-        goto l_end;
-    tmpath[0] = '\0';          /* in place now */
-
-    if (sync_dir(target) != 0)  /* replaced, but the rename may not last */
-        goto l_end;
-
-    rc = 1;
+    /* a failed sync of the directory is reported after the rename */
+    rc = n_atomic_commit(af) == 0;
+    af = NULL;
 
  l_end:
     tndb_free(db);
@@ -583,11 +463,8 @@ static int tndbw_close(struct tndb *db)
     if (fdin >= 0)
         close(fdin);
 
-    if (fdout >= 0)
-        close(fdout);
-
-    if (!rc && tmpath[0])
-        unlink(tmpath);
+    if (af != NULL)
+        n_atomic_abort(af);
 
     return rc;
 }

@@ -2,15 +2,17 @@
    renamed into place by tndb_close(): a failed close leaves an existing
    file as it was, and a new file gets the mode (and, with the privileges,
    the owner) of the old one.  rename(), n_stream_close(), copy_file_range(),
-   write(), close(), fchown() and fsync() are wrapped to fail on demand, and so is
-   n_stream_dopen(), to make a stream's flush fail. */
+   write(), close(), fchown() and fsync() are wrapped to fail on demand, and
+   so is n_stream_dopen(), to make a stream's flush fail. */
 #define _GNU_SOURCE 1           /* copy_file_range(), loff_t */
 
 #ifdef HAVE_CONFIG_H
 # include "config.h"
 #endif
 
+#include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <limits.h>
 #include <stdio.h>
@@ -21,6 +23,14 @@
 
 #include <trurl/n_check.h>
 
+/* what libtrurl calls (the commit of trurl/natomic.h: rename(), close(),
+   fchown(), fsync()) is not reached by --wrap, so these are defined here,
+   exported despite -fvisibility=hidden, and the real ones are found with
+   dlsym(RTLD_NEXT) */
+#define INTERPOSED __attribute__((visibility("default")))
+#define LOAD(name) \
+    do { if (real_##name == NULL) real_##name = dlsym(RTLD_NEXT, #name); } while (0)
+
 #include "tndb.h"
 
 static int rename_fails;
@@ -28,12 +38,14 @@ static char renamed_from[PATH_MAX];
 static int close_calls, close_fail_at;
 static int dopen_calls, flush_fail_at;
 
-int __real_rename(const char *oldpath, const char *newpath);
+static int (*real_rename)(const char *, const char *);
 int __real_n_stream_close(tn_stream *st);
 tn_stream *__real_n_stream_dopen(int fd, const char *mode, int type);
 
-int __wrap_rename(const char *oldpath, const char *newpath)
+INTERPOSED int rename(const char *oldpath, const char *newpath)
 {
+    LOAD(rename);
+
     snprintf(renamed_from, sizeof(renamed_from), "%s", oldpath);
 
     if (rename_fails) {
@@ -41,13 +53,23 @@ int __wrap_rename(const char *oldpath, const char *newpath)
         return -1;
     }
 
-    return __real_rename(oldpath, newpath);
+    return real_rename(oldpath, newpath);
 }
 
 /* 0 real, 1 always ENOSYS, 2 a part then ENOSYS, 3 a part then EIO,
    4 always EPERM (a seccomp filter that does not know the syscall) */
 static int cfr_mode;
 static int cfr_calls;
+
+/* the descriptors tndb hands to a stream or copies with are close-on-exec:
+   a child forked while a database is written must not keep them */
+static int inherited_fds;
+
+static void check_cloexec(int fd)
+{
+    if ((fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0)
+        inherited_fds++;
+}
 
 #ifdef HAVE_COPY_FILE_RANGE
 ssize_t __real_copy_file_range(int fd_in, loff_t *off_in, int fd_out,
@@ -56,6 +78,9 @@ ssize_t __real_copy_file_range(int fd_in, loff_t *off_in, int fd_out,
 ssize_t __wrap_copy_file_range(int fd_in, loff_t *off_in, int fd_out,
                                loff_t *off_out, size_t len, unsigned int flags)
 {
+    check_cloexec(fd_in);
+    check_cloexec(fd_out);
+
     if (cfr_mode == 1 || cfr_mode == 4) {
         errno = cfr_mode == 1 ? ENOSYS : EPERM;
         return -1;
@@ -102,7 +127,10 @@ static int failing_st_flush(void *stream)
 
 tn_stream *__wrap_n_stream_dopen(int fd, const char *mode, int type)
 {
-    tn_stream *st = __real_n_stream_dopen(fd, mode, type);
+    tn_stream *st;
+
+    check_cloexec(fd);
+    st = __real_n_stream_dopen(fd, mode, type);
 
     if (st != NULL && ++dopen_calls == flush_fail_at) {
         real_st_flush = st->st_flush;
@@ -119,6 +147,8 @@ ssize_t __real_write(int fd, const void *buf, size_t len);
 
 ssize_t __wrap_write(int fd, const void *buf, size_t len)
 {
+    check_cloexec(fd);
+
     if (short_writes) {
         if (write_calls++ == 0) {
             errno = EINTR;
@@ -137,29 +167,33 @@ ssize_t __wrap_write(int fd, const void *buf, size_t len)
    anyway, as on Linux */
 static int close_named_fails;
 
-int __real_close(int fd);
+static int (*real_close)(int);
 
-int __wrap_close(int fd)
+INTERPOSED int close(int fd)
 {
     struct stat sb;
 
+    LOAD(close);
+
     if (close_named_fails && fstat(fd, &sb) == 0 && sb.st_nlink > 0) {
-        __real_close(fd);
+        real_close(fd);
         errno = EIO;
         return -1;
     }
 
-    return __real_close(fd);
+    return real_close(fd);
 }
 
 static int fchown_calls, fchown_errno;
 static uid_t fchown_uid;
 static gid_t fchown_gid;
 
-int __real_fchown(int fd, uid_t uid, gid_t gid);
+static int (*real_fchown)(int, uid_t, gid_t);
 
-int __wrap_fchown(int fd, uid_t uid, gid_t gid)
+INTERPOSED int fchown(int fd, uid_t uid, gid_t gid)
 {
+    LOAD(fchown);
+
     fchown_calls++;
     fchown_uid = uid;
     fchown_gid = gid;
@@ -169,7 +203,7 @@ int __wrap_fchown(int fd, uid_t uid, gid_t gid)
         return -1;
     }
 
-    return __real_fchown(fd, uid, gid);
+    return real_fchown(fd, uid, gid);
 }
 
 /* 1 fails the file's fsync(), 2 the directory's with EIO, 3 with EINVAL;
@@ -178,11 +212,13 @@ static int fsync_fail, file_syncs, dir_syncs, file_synced_renamed;
 static dev_t synced_dev;
 static ino_t synced_ino;
 
-int __real_fsync(int fd);
+static int (*real_fsync)(int);
 
-int __wrap_fsync(int fd)
+INTERPOSED int fsync(int fd)
 {
     struct stat sb;
+
+    LOAD(fsync);
 
     fail_if(fstat(fd, &sb) != 0, "cannot fstat %d", fd);
 
@@ -204,7 +240,7 @@ int __wrap_fsync(int fd)
         }
     }
 
-    return __real_fsync(fd);
+    return real_fsync(fd);
 }
 
 /* <dir>/.<name>.tmp.XXXXXX; keep in sync with open_tmpfile() */
@@ -285,7 +321,9 @@ START_TEST(test_atomic_write)
 
     unlink_db(path);
     renamed_from[0] = '\0';
+    inherited_fds = 0;
     write_db(path, "first");
+    expect_int(inherited_fds, 0);
     expect_db(path, "first");
     expect_int(tmp_files(path), 0);
 
@@ -480,6 +518,30 @@ START_TEST(test_atomic_symlink)
     unlink_db(link2);
     unlink_db(link1);
     unlink_db(real);
+}
+END_TEST
+
+/* a directory as the target fails the close with EISDIR, instead of a
+   rename() over it */
+START_TEST(test_atomic_dir_target)
+{
+    const char *dir = NTEST_TMPPATH("tndb-atomic-dir");
+    struct tndb *db;
+    struct stat sb;
+
+    rmdir(dir);
+    fail_if(mkdir(dir, 0700) != 0, "cannot mkdir %s", dir);
+
+    db = tndb_creat(dir, -1, TNDB_SIGN_DIGEST);
+    fail_if(db == NULL, "cannot create %s", dir);
+    expect_int(tndb_put(db, "key", 3, "new", 3), 1);
+    errno = 0;
+    expect_int(tndb_close(db), 0);
+    expect_int(errno, EISDIR);
+
+    fail_if(stat(dir, &sb) != 0 || !S_ISDIR(sb.st_mode), "%s replaced", dir);
+    expect_int(tmp_files(dir), 0);
+    rmdir(dir);
 }
 END_TEST
 
@@ -689,6 +751,7 @@ START_TEST(test_atomic_copy_fallback)
 
         short_writes = i == CFR_MODES;
         write_calls = 0;
+        inherited_fds = 0;
         mode = cfr_mode = short_writes ? 1 : cfr_modes[i];
         cfr_calls = 0;
 
@@ -698,6 +761,7 @@ START_TEST(test_atomic_copy_fallback)
         expect_int(tndb_close(db), 1);
 
         cfr_mode = 0;
+        expect_int(inherited_fds, 0);
         if (short_writes) {
             short_writes = 0;
             fail_if(write_calls < 3, "no short writes (%d)", write_calls);
@@ -757,6 +821,7 @@ NTEST_RUNNER("tndb-atomic",
              test_atomic_mode,
              test_atomic_symlink,
              test_atomic_symlink_loop,
+             test_atomic_dir_target,
              test_atomic_fsync,
              test_atomic_fsync_failure,
              test_atomic_owner,

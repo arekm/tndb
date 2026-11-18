@@ -85,6 +85,8 @@ AC_CHECK_LIB(crypto, EVP_DigestInit, [], [AC_MSG_ERROR(["libcrypto is needed by 
 AC_MSG_CHECKING([for local trurlib copy in ../trurlib])
 if test -f "${srcdir}/../trurlib/include/trurl/trurl.h"; then
 	AC_MSG_RESULT([yes])
+	test -f "${srcdir}/../trurlib/include/trurl/natomic.h" ||
+		AC_MSG_ERROR([../trurlib is too old: natomic.h is missing])
 	CPPFLAGS="$CPPFLAGS -I\$(top_srcdir)/../trurlib/include/"
 	LDFLAGS="$LDFLAGS -L\$(top_builddir)/../trurlib"
 	LIBS="$LIBS -ltrurl"
@@ -93,7 +95,8 @@ else
 	AC_CHECK_HEADER([trurl/trurl.h],
 			[],
 			[AC_MSG_ERROR([trurl.h is missing])])
-	AC_CHECK_LIB(trurl, n_cfree)
+	AC_CHECK_LIB(trurl, n_atomic_open, [],
+		[AC_MSG_ERROR([trurlib with n_atomic_open() is needed by $PACKAGE])])
         AC_CHECK_FUNCS(n_stream_guess_type)
 fi
 
