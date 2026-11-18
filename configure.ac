@@ -76,7 +76,7 @@ AC_TYPE_UINT32_T
 
 # Checks for library functions.
 AC_FUNC_ALLOCA
-AC_CHECK_FUNCS([gettimeofday memset mkstemp rmdir])
+AC_CHECK_FUNCS([gettimeofday memset mkstemp rmdir copy_file_range])
 
 # Checks for libraries.
 AC_CHECK_LIB(crypto, EVP_DigestInit, [], [AC_MSG_ERROR(["libcrypto is needed by $PACKAGE"])])

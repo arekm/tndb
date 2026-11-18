@@ -14,6 +14,14 @@
 # include "config.h"
 #endif
 
+#ifdef HAVE_COPY_FILE_RANGE
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE 1 /* copy_file_range() is declared only with _GNU_SOURCE */
+#endif
+#define COPY_CHUNK_MAX 0x7ffff000 /* the most one copy_file_range() call moves */
+#endif
+
+#include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -22,7 +30,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-
 
 #include <trurl/nmalloc.h>
 #include <trurl/narray.h>
@@ -48,6 +55,90 @@ static int st_write_hook_nowrite(const void *buf, size_t size, void *arg)
     return 0;
 }
 
+/* <dir>/.<name>.tmp.XXXXXX */
+static int open_tmpfile(char *tmpath, size_t size, const char *path)
+{
+    const char *base = strrchr(path, '/');
+    int fd, n;
+
+    if (base != NULL)
+        n = snprintf(tmpath, size, "%.*s.%s.tmp.XXXXXX",
+                     (int)(base - path + 1), path, base + 1);
+    else
+        n = snprintf(tmpath, size, ".%s.tmp.XXXXXX", path);
+
+    if (n < 0 || (size_t)n >= size) {
+        errno = ENAMETOOLONG;
+        *tmpath = '\0';
+        return -1;
+    }
+
+#ifdef HAVE_MKSTEMP
+    fd = mkstemp(tmpath);
+#else
+    fd = open(tmpath, O_RDWR | O_CREAT | O_TRUNC | O_EXCL, 0600);
+#endif
+    if (fd == -1) {
+        *tmpath = '\0';
+        return -1;
+    }
+
+    return fd;
+}
+
+#define SYMLINKS_MAX 40         /* Linux's MAXSYMLINKS */
+
+/* the file a write to path ends up in, as open(..., O_CREAT) would find
+   it: the symlinks of the last component followed, a dangling one to its
+   (new) target; the directories are left as they are, rename() works
+   through them */
+static int resolve_target(const char *path, char *out, size_t size)
+{
+    char        link[PATH_MAX], tmp[PATH_MAX];
+    struct stat st;
+    const char  *slash;
+    ssize_t     len;
+    int         n, depth;
+
+    if ((size_t)snprintf(out, size, "%s", path) >= size)
+        goto l_toolong;
+
+    for (depth = 0; depth < SYMLINKS_MAX; depth++) {
+        if (lstat(out, &st) != 0)
+            return errno == ENOENT ? 0 : -1; /* a new file */
+
+        if (!S_ISLNK(st.st_mode))
+            return 0;
+
+        if ((len = readlink(out, link, sizeof(link))) == -1)
+            return -1;
+
+        if ((size_t)len >= sizeof(link)) /* cut */
+            goto l_toolong;
+        link[len] = '\0';
+
+        /* a relative target is relative to the link's directory */
+        slash = strrchr(out, '/');
+        if (link[0] == '/' || slash == NULL)
+            n = snprintf(tmp, sizeof(tmp), "%s", link);
+        else
+            n = snprintf(tmp, sizeof(tmp), "%.*s%s",
+                         (int)(slash - out + 1), out, link);
+
+        if (n < 0 || (size_t)n >= sizeof(tmp) || (size_t)n >= size)
+            goto l_toolong;
+
+        memcpy(out, tmp, (size_t)n + 1);
+    }
+
+    errno = ELOOP;
+    return -1;
+
+ l_toolong:
+    errno = ENAMETOOLONG;
+    return -1;
+}
+
 struct tndb *tndb_creat(const char *name, int comprlevel, unsigned flags)
 {
     char                path[PATH_MAX], mode[32] = "wb";
@@ -55,13 +146,7 @@ struct tndb *tndb_creat(const char *name, int comprlevel, unsigned flags)
     struct tndb         *db = NULL;
     int                 fd, type = TN_STREAM_STDIO;
 
-    snprintf(path, sizeof(path), "%s.tmpXXXXXX", name);
-
-#ifdef HAVE_MKSTEMP
-    fd = mkstemp(path);
-#else
-    fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_EXCL, 0600);
-#endif
+    fd = open_tmpfile(path, sizeof(path), name);
     if (fd < 0)
         return NULL;
 
@@ -264,25 +349,166 @@ static int htt_compute_digest(struct tndb *db)
     return rc;
 }
 
+/* what the new file gets: the mode and owner of the one it replaces, or
+   what open(..., 0666) would have given a new one.  fchown() to another
+   user needs privileges, so it is best effort: the file stays the
+   writer's. */
+static int setperms(int fd, const char *src)
+{
+    struct stat st;
+    mode_t mask;
+
+    if (stat(src, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (fchown(fd, st.st_uid, st.st_gid) != 0 && errno != EPERM)
+            return 0;
+
+        /* chown() clears them; neither setuid nor setgid is kept anyway */
+        return fchmod(fd, st.st_mode & 0777) == 0;
+    }
+
+    /* a new file; umask() is process-wide, and the writer of a database
+       does not create unrelated files at the same time */
+    mask = umask(0);
+    umask(mask);
+
+    return fchmod(fd, 0666 & ~mask) == 0;
+}
+
+static int fsync_retry(int fd)
+{
+    int rc;
+
+    while ((rc = fsync(fd)) != 0 && errno == EINTR)
+        ;
+    return rc;
+}
+
+/* without it a crash can keep the old name pointing at the old file; a
+   filesystem that cannot sync a directory (EINVAL) does not need to */
+static int sync_dir(const char *path)
+{
+    char        dir[PATH_MAX];
+    const char  *slash = strrchr(path, '/');
+    int         fd, rc = 0;
+
+    if (slash == NULL)
+        snprintf(dir, sizeof(dir), ".");
+    else if (slash == path)
+        snprintf(dir, sizeof(dir), "/");
+    else
+        snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+
+    if ((fd = open(dir, O_RDONLY | O_DIRECTORY)) == -1)
+        return -1;
+
+    if (fsync_retry(fd) != 0 && errno != EINVAL && errno != ENOTSUP)
+        rc = -1;
+
+    close(fd);
+    return rc;
+}
+
+/* copies the whole fdin, from offset 0, to the end of fdout */
+static int append_body(int fdin, int fdout)
+{
+    off_t in_off = 0;
+
+    if (lseek(fdout, 0, SEEK_END) == -1)
+        return -1;
+
+#ifdef HAVE_COPY_FILE_RANGE
+    for (;;) {
+        ssize_t n;
+
+        n = copy_file_range(fdin, &in_off, fdout, NULL, COPY_CHUNK_MAX, 0);
+        if (n == 0)             /* EOF */
+            return 0;
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+
+            /* no kernel copy here; read/write from where it stopped.  EPERM
+               is what an older seccomp filter gives for a syscall it does
+               not know; a real one comes back from write() */
+            if (errno == ENOSYS || errno == EXDEV || errno == EINVAL ||
+                errno == EOPNOTSUPP || errno == EPERM)
+                break;
+
+            return -1;
+        }
+    }
+#endif
+
+    if (lseek(fdin, in_off, SEEK_SET) == -1)
+        return -1;
+
+    {
+        char buf[1024 * 16];
+        ssize_t nread;
+
+        while ((nread = read(fdin, buf, sizeof(buf))) != 0) {
+            ssize_t nwritten = 0;
+
+            if (nread < 0) {
+                if (errno == EINTR)
+                    continue;
+                return -1;
+            }
+
+            while (nwritten < nread) {
+                ssize_t n;
+
+                n = write(fdout, buf + nwritten,
+                          (size_t)(nread - nwritten));
+                if (n < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    return -1;
+                }
+
+                if (n == 0) {
+                    errno = EIO;
+                    return -1;
+                }
+
+                nwritten += n;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
 static int tndbw_close(struct tndb *db)
 {
-    ssize_t nread;
-    char   buf[1024 * 16];
+    char   tmpath[PATH_MAX + 16], target[PATH_MAX];
     int    fdin = -1, fdout = -1, type, rc;
 
     rc = 0;
+    tmpath[0] = '\0';
     n_assert(db->rtflags & TNDB_R_MODE_W);
 
-    n_stream_flush(db->st);
+    if (n_stream_flush(db->st) != 0)
+        goto l_end;
     type = db->st->type;
 
     if ((fdin = dup(db->st->fd)) == -1)
         goto l_end;
 
-    n_stream_close(db->st);
+    /* the trailer belongs to the body: a failure here cuts it */
+    if (n_stream_close(db->st) != 0) {
+        db->st = NULL;
+        goto l_end;
+    }
     db->st = NULL;
 
-    if ((fdout = open(db->path, O_RDWR | O_CREAT | O_TRUNC, 0666)) == -1)
+    /* through a symlink the target is replaced, not the link */
+    if (resolve_target(db->path, target, sizeof(target)) != 0)
+        goto l_end;
+
+    if ((fdout = open_tmpfile(tmpath, sizeof(tmpath), target)) == -1)
         goto l_end;
 
     if ((db->st = n_stream_dopen(fdout, "wb", type)) == NULL)
@@ -312,26 +538,44 @@ static int tndbw_close(struct tndb *db)
             goto l_end;
     }
 
-    n_stream_flush(db->st);
+    if (n_stream_flush(db->st) != 0)
+        goto l_end;
+
     if ((fdout = dup(db->st->fd)) == -1)
         goto l_end;
 
-    n_stream_close(db->st);
+    if (n_stream_close(db->st) != 0) {
+        db->st = NULL;
+        goto l_end;
+    }
     db->st = NULL;
 
-    if (lseek(fdin, 0, SEEK_SET) == -1)
+    if (append_body(fdin, fdout) != 0)
         goto l_end;
 
-    if (lseek(fdout, 0, SEEK_END) == -1)
+    /* written 0600 and owned by the writer until now; the rename() is what
+       makes the file visible with these */
+    if (!setperms(fdout, target))
         goto l_end;
 
-    while ((nread = read(fdin, buf, sizeof(buf))) > 0) {
-        if (write(fdout, buf, nread) != (int)nread)
-            goto l_end;
+    /* a crash after the rename() must not find a cut file under the name */
+    if (fsync_retry(fdout) != 0)
+        goto l_end;
+
+    if (close(fdout) != 0) {    /* the body is on disk now or never */
+        fdout = -1;
+        goto l_end;
     }
+    fdout = -1;
 
-    if (nread != -1)
-        rc = 1;
+    if (rename(tmpath, target) != 0)
+        goto l_end;
+    tmpath[0] = '\0';          /* in place now */
+
+    if (sync_dir(target) != 0)  /* replaced, but the rename may not last */
+        goto l_end;
+
+    rc = 1;
 
  l_end:
     tndb_free(db);
@@ -341,6 +585,9 @@ static int tndbw_close(struct tndb *db)
 
     if (fdout >= 0)
         close(fdout);
+
+    if (!rc && tmpath[0])
+        unlink(tmpath);
 
     return rc;
 }
