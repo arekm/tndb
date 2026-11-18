@@ -1,7 +1,8 @@
-/* the database is written as name.tmpXXXXXX and renamed into place by
-   tndb_close(): a failed close leaves an existing file as it was, and a
-   new file gets the mode (and, with the privileges, the owner) of the old
-   one.  rename() and n_stream_close() are wrapped to fail on demand. */
+/* the database is written as the hidden .<name>.tmp.XXXXXX next to it and
+   renamed into place by tndb_close(): a failed close leaves an existing
+   file as it was, and a new file gets the mode (and, with the privileges,
+   the owner) of the old one.  rename() and n_stream_close() are wrapped to
+   fail on demand. */
 #ifdef HAVE_CONFIG_H
 # include "config.h"
 #endif
@@ -50,10 +51,16 @@ int __wrap_n_stream_close(tn_stream *st)
 static int tmp_files(const char *path)
 {
     char pattern[PATH_MAX + 16];
+    const char *base = strrchr(path, '/');
     glob_t g;
     int n;
 
-    snprintf(pattern, sizeof(pattern), "%s.tmp*", path);
+    if (base != NULL)
+        snprintf(pattern, sizeof(pattern), "%.*s.%s.tmp.*",
+                 (int)(base - path + 1), path, base + 1);
+    else
+        snprintf(pattern, sizeof(pattern), ".%s.tmp.*", path);
+
     n = glob(pattern, 0, NULL, &g) == 0 ? (int)g.gl_pathc : 0;
     globfree(&g);
     return n;

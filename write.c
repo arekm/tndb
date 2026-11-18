@@ -49,11 +49,19 @@ static int st_write_hook_nowrite(const void *buf, size_t size, void *arg)
     return 0;
 }
 
+/* <dir>/.<name>.tmp.XXXXXX */
 static int open_tmpfile(char *tmpath, size_t size, const char *path)
 {
-    int fd;
+    const char *base = strrchr(path, '/');
+    int fd, n;
 
-    if (snprintf(tmpath, size, "%s.tmpXXXXXX", path) >= (int)size) {
+    if (base != NULL)
+        n = snprintf(tmpath, size, "%.*s.%s.tmp.XXXXXX",
+                     (int)(base - path + 1), path, base + 1);
+    else
+        n = snprintf(tmpath, size, ".%s.tmp.XXXXXX", path);
+
+    if (n < 0 || (size_t)n >= size) {
         errno = ENAMETOOLONG;
         *tmpath = '\0';
         return -1;

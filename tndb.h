@@ -33,9 +33,9 @@ struct tndb;
 #define TNDB_NOHASH       (1 << 7)         /* build db without hash table */
 #define TNDB_SIGNED       TNDB_SIGN_DIGEST /* build signed db */
 
-/* creates new database; it is written as name.tmpXXXXXX and renamed into
-   place by tndb_close(), so a failed close leaves an existing file as it
-   was */
+/* creates new database; it is written as the hidden .<name>.tmp.XXXXXX
+   next to it and renamed into place by tndb_close(), so a failed close
+   leaves an existing file as it was */
 EXPORT struct tndb *tndb_creat(const char *name, int comprlevel, unsigned flags);
 
 EXPORT int tndb_put(struct tndb *db, const char *key, unsigned int klen,
