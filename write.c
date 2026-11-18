@@ -374,6 +374,40 @@ static int setperms(int fd, const char *src)
     return fchmod(fd, 0666 & ~mask) == 0;
 }
 
+static int fsync_retry(int fd)
+{
+    int rc;
+
+    while ((rc = fsync(fd)) != 0 && errno == EINTR)
+        ;
+    return rc;
+}
+
+/* without it a crash can keep the old name pointing at the old file; a
+   filesystem that cannot sync a directory (EINVAL) does not need to */
+static int sync_dir(const char *path)
+{
+    char        dir[PATH_MAX];
+    const char  *slash = strrchr(path, '/');
+    int         fd, rc = 0;
+
+    if (slash == NULL)
+        snprintf(dir, sizeof(dir), ".");
+    else if (slash == path)
+        snprintf(dir, sizeof(dir), "/");
+    else
+        snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+
+    if ((fd = open(dir, O_RDONLY | O_DIRECTORY)) == -1)
+        return -1;
+
+    if (fsync_retry(fd) != 0 && errno != EINVAL && errno != ENOTSUP)
+        rc = -1;
+
+    close(fd);
+    return rc;
+}
+
 /* copies the whole fdin, from offset 0, to the end of fdout */
 static int append_body(int fdin, int fdout)
 {
@@ -522,6 +556,10 @@ static int tndbw_close(struct tndb *db)
     if (!setperms(fdout, target))
         goto l_end;
 
+    /* a crash after the rename() must not find a cut file under the name */
+    if (fsync_retry(fdout) != 0)
+        goto l_end;
+
     if (close(fdout) != 0) {    /* the body is on disk now or never */
         fdout = -1;
         goto l_end;
@@ -529,6 +567,10 @@ static int tndbw_close(struct tndb *db)
     fdout = -1;
 
     if (rename(tmpath, target) != 0)
+        goto l_end;
+    tmpath[0] = '\0';          /* in place now */
+
+    if (sync_dir(target) != 0)  /* replaced, but the rename may not last */
         goto l_end;
 
     rc = 1;

@@ -2,7 +2,7 @@
    renamed into place by tndb_close(): a failed close leaves an existing
    file as it was, and a new file gets the mode (and, with the privileges,
    the owner) of the old one.  rename(), n_stream_close(), copy_file_range(),
-   write(), close() and fchown() are wrapped to fail on demand, and so is
+   write(), close(), fchown() and fsync() are wrapped to fail on demand, and so is
    n_stream_dopen(), to make a stream's flush fail. */
 #define _GNU_SOURCE 1           /* copy_file_range(), loff_t */
 
@@ -169,6 +169,41 @@ int __wrap_fchown(int fd, uid_t uid, gid_t gid)
     }
 
     return __real_fchown(fd, uid, gid);
+}
+
+/* 1 fails the file's fsync(), 2 the directory's with EIO, 3 with EINVAL;
+   what is synced, and whether before the rename(), is recorded */
+static int fsync_fail, file_syncs, dir_syncs, file_synced_renamed;
+static dev_t synced_dev;
+static ino_t synced_ino;
+
+int __real_fsync(int fd);
+
+int __wrap_fsync(int fd)
+{
+    struct stat sb;
+
+    fail_if(fstat(fd, &sb) != 0, "cannot fstat %d", fd);
+
+    if (S_ISDIR(sb.st_mode)) {
+        dir_syncs++;
+        synced_dev = sb.st_dev;
+        synced_ino = sb.st_ino;
+        if (fsync_fail == 2 || fsync_fail == 3) {
+            errno = fsync_fail == 2 ? EIO : EINVAL;
+            return -1;
+        }
+
+    } else {
+        file_syncs++;
+        file_synced_renamed = renamed_from[0] != '\0';
+        if (fsync_fail == 1) {
+            errno = EIO;
+            return -1;
+        }
+    }
+
+    return __real_fsync(fd);
 }
 
 /* <dir>/.<name>.tmp.XXXXXX; keep in sync with open_tmpfile() */
@@ -472,6 +507,62 @@ START_TEST(test_atomic_symlink_loop)
 }
 END_TEST
 
+/* the file is synced before the rename(), its directory after */
+START_TEST(test_atomic_fsync)
+{
+    const char *path = NTEST_TMPPATH("tndb-atomic-fsync.db");
+    char dir[PATH_MAX];
+    struct stat sb;
+
+    snprintf(dir, sizeof(dir), "%.*s", (int)(strrchr(path, '/') - path), path);
+    fail_if(stat(dir, &sb) != 0, "cannot stat %s", dir);
+
+    unlink_db(path);
+    renamed_from[0] = '\0';
+    file_syncs = dir_syncs = 0;
+    synced_ino = 0;
+    write_db(path, "new");
+    expect_db(path, "new");
+
+    expect_int(file_syncs, 1);
+    expect_int(file_synced_renamed, 0);
+    expect_int(dir_syncs, 1);
+    fail_unless(synced_dev == sb.st_dev && synced_ino == sb.st_ino,
+                "%s not synced", dir);
+    unlink_db(path);
+}
+END_TEST
+
+/* a failed sync of the file keeps the old one; of the directory, the new
+   one is in place but the close fails, unless the filesystem cannot sync
+   a directory */
+START_TEST(test_atomic_fsync_failure)
+{
+    const char *path = NTEST_TMPPATH("tndb-atomic-fsyncerr.db");
+
+    unlink_db(path);
+    write_db(path, "old");
+
+    fsync_fail = 1;
+    expect_failed_rewrite(path);
+    fsync_fail = 0;
+    expect_db(path, "old");
+    expect_int(tmp_files(path), 0);
+
+    fsync_fail = 2;
+    expect_failed_rewrite(path);
+    fsync_fail = 0;
+    expect_db(path, "new");
+    expect_int(tmp_files(path), 0);
+
+    fsync_fail = 3;
+    write_db(path, "newer");
+    fsync_fail = 0;
+    expect_db(path, "newer");
+    unlink_db(path);
+}
+END_TEST
+
 /* the owner and group of a replaced file are passed to fchown(); a refused
    fchown() (EPERM, another user's file) still writes, any other error does
    not */
@@ -664,6 +755,8 @@ NTEST_RUNNER("tndb-atomic",
              test_atomic_mode,
              test_atomic_symlink,
              test_atomic_symlink_loop,
+             test_atomic_fsync,
+             test_atomic_fsync_failure,
              test_atomic_owner,
              test_atomic_group,
              test_atomic_flush_failure,
