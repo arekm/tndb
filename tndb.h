@@ -35,7 +35,9 @@ struct tndb;
 
 /* creates new database; it is written as the hidden .<name>.tmp.XXXXXX
    next to it and renamed into place by tndb_close(), so a failed close
-   leaves an existing file as it was */
+   leaves an existing file as it was.  A symlink is followed to its
+   target, which is replaced; a hard link is split, the other names keep
+   the old content */
 EXPORT struct tndb *tndb_creat(const char *name, int comprlevel, unsigned flags);
 
 EXPORT int tndb_put(struct tndb *db, const char *key, unsigned int klen,

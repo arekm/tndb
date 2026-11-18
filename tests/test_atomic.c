@@ -190,6 +190,16 @@ static int tmp_files(const char *path)
     return n;
 }
 
+/* path and the .md5 tndb_verify() leaves next to it */
+static void unlink_db(const char *path)
+{
+    char md5[PATH_MAX + 8];
+
+    snprintf(md5, sizeof(md5), "%s.md5", path);
+    unlink(md5);
+    unlink(path);
+}
+
 static void write_db(const char *path, const char *val)
 {
     struct tndb *db = tndb_creat(path, -1, TNDB_SIGN_DIGEST);
@@ -237,7 +247,7 @@ START_TEST(test_atomic_write)
     const char *from;
     char prefix[PATH_MAX];
 
-    unlink(path);
+    unlink_db(path);
     renamed_from[0] = '\0';
     write_db(path, "first");
     expect_db(path, "first");
@@ -253,7 +263,7 @@ START_TEST(test_atomic_write)
     fail_if(strncmp(from + 1, prefix, strlen(prefix)) != 0,
             "%s is not %sXXXXXX", from + 1, prefix);
     expect_int((int)strlen(from + 1), (int)strlen(prefix) + 6);
-    unlink(path);
+    unlink_db(path);
 }
 END_TEST
 
@@ -265,7 +275,7 @@ START_TEST(test_atomic_mode)
     struct stat sb;
     mode_t mask;
 
-    unlink(path);
+    unlink_db(path);
     mask = umask(022);
     write_db(path, "new");
     umask(mask);
@@ -280,7 +290,7 @@ START_TEST(test_atomic_mode)
     fail_if(stat(path, &sb) != 0, "cannot stat %s", path);
     expect_int(sb.st_mode & 0777, 0640);
     expect_int(tmp_files(path), 0);
-    unlink(path);
+    unlink_db(path);
 }
 END_TEST
 
@@ -292,7 +302,7 @@ START_TEST(test_atomic_flush_failure)
     int n;
 
     for (n = 1; n <= 2; n++) {
-        unlink(path);
+        unlink_db(path);
         write_db(path, "old");
 
         dopen_calls = flush_failed = 0;
@@ -304,7 +314,7 @@ START_TEST(test_atomic_flush_failure)
         expect_db(path, "old");
         expect_int(tmp_files(path), 0);
     }
-    unlink(path);
+    unlink_db(path);
 }
 END_TEST
 
@@ -313,7 +323,7 @@ START_TEST(test_atomic_fdclose_failure)
     const char *path = NTEST_TMPPATH("tndb-atomic-fdclose.db");
     struct tndb *db;
 
-    unlink(path);
+    unlink_db(path);
     write_db(path, "old");
 
     db = tndb_creat(path, -1, TNDB_SIGN_DIGEST);
@@ -325,7 +335,7 @@ START_TEST(test_atomic_fdclose_failure)
 
     expect_db(path, "old");
     expect_int(tmp_files(path), 0);
-    unlink(path);
+    unlink_db(path);
 }
 END_TEST
 
@@ -334,7 +344,7 @@ START_TEST(test_atomic_rename_failure)
     const char *path = NTEST_TMPPATH("tndb-atomic-rename.db");
     struct tndb *db;
 
-    unlink(path);
+    unlink_db(path);
     write_db(path, "old");
 
     rename_fails = 1;
@@ -346,7 +356,119 @@ START_TEST(test_atomic_rename_failure)
 
     expect_db(path, "old");
     expect_int(tmp_files(path), 0);
-    unlink(path);
+    unlink_db(path);
+}
+END_TEST
+
+/* path, read through its symlinks, is a regular file holding val */
+static void expect_link(const char *path, const char *val)
+{
+    struct stat sb;
+
+    fail_if(lstat(path, &sb) != 0, "cannot lstat %s", path);
+    fail_unless(S_ISLNK(sb.st_mode), "%s is no longer a symlink", path);
+    expect_db(path, val);
+}
+
+/* the directories of the two paths are the same one */
+static int same_dir(const char *a, const char *b)
+{
+    char da[PATH_MAX], db[PATH_MAX];
+    struct stat sa, sb;
+
+    snprintf(da, sizeof(da), "%.*s", (int)(strrchr(a, '/') - a), a);
+    snprintf(db, sizeof(db), "%.*s", (int)(strrchr(b, '/') - b), b);
+    fail_if(stat(da, &sa) != 0 || stat(db, &sb) != 0,
+            "cannot stat %s or %s", da, db);
+
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* a write through a symlink replaces its target, as the open(O_TRUNC) of
+   the in-place write did: absolute, relative to the link's directory, a
+   chain, and a dangling one, whose target is created */
+START_TEST(test_atomic_symlink)
+{
+    const char *real = NTEST_TMPPATH("tndb-atomic-real.db");
+    const char *link1 = NTEST_TMPPATH("tndb-atomic-link1.db");
+    const char *link2 = NTEST_TMPPATH("tndb-atomic-link2.db");
+    const char *dir = NTEST_TMPPATH("tndb-atomic-sub");
+    char sublink[PATH_MAX], rel[PATH_MAX];
+
+    snprintf(sublink, sizeof(sublink), "%s/link.db", dir);
+    snprintf(rel, sizeof(rel), "../%s", strrchr(real, '/') + 1);
+
+    unlink_db(real);
+    unlink_db(link1);
+    unlink_db(link2);
+    unlink_db(sublink);
+    rmdir(dir);
+    write_db(real, "old");
+
+    /* absolute */
+    fail_if(symlink(real, link1) != 0, "cannot symlink %s", link1);
+    write_db(link1, "abs");
+    expect_link(link1, "abs");
+    expect_db(real, "abs");
+    expect_int(tmp_files(real), 0);
+    expect_int(tmp_files(link1), 0);
+
+    /* a chain: link2 -> link1 -> real */
+    fail_if(symlink(link1, link2) != 0, "cannot symlink %s", link2);
+    write_db(link2, "chain");
+    expect_link(link2, "chain");
+    expect_link(link1, "chain");
+    expect_db(real, "chain");
+
+    /* relative to the link's directory, not to the cwd */
+    fail_if(mkdir(dir, 0755) != 0, "cannot mkdir %s", dir);
+    fail_if(symlink(rel, sublink) != 0, "cannot symlink %s", sublink);
+    renamed_from[0] = '\0';
+    write_db(sublink, "rel");
+    expect_link(sublink, "rel");
+    expect_db(real, "rel");
+    expect_int(tmp_files(sublink), 0);
+
+    /* the temp is next to the target, so the rename() does not cross a
+       filesystem */
+    expect_int(same_dir(renamed_from, real), 1);
+
+    /* dangling */
+    unlink_db(real);
+    write_db(link1, "dangling");
+    expect_link(link1, "dangling");
+    expect_db(real, "dangling");
+
+    unlink_db(sublink);
+    rmdir(dir);
+    unlink_db(link2);
+    unlink_db(link1);
+    unlink_db(real);
+}
+END_TEST
+
+/* a symlink loop fails the close, and nothing is left */
+START_TEST(test_atomic_symlink_loop)
+{
+    const char *a = NTEST_TMPPATH("tndb-atomic-loop-a.db");
+    const char *b = NTEST_TMPPATH("tndb-atomic-loop-b.db");
+    struct tndb *db;
+
+    unlink_db(a);
+    unlink_db(b);
+    fail_if(symlink(b, a) != 0 || symlink(a, b) != 0, "cannot symlink");
+
+    db = tndb_creat(a, -1, TNDB_SIGN_DIGEST);
+    fail_if(db == NULL, "cannot create %s", a);
+    expect_int(tndb_put(db, "key", 3, "new", 3), 1);
+    errno = 0;
+    expect_int(tndb_close(db), 0);
+    expect_int(errno, ELOOP);
+
+    expect_int(tmp_files(a), 0);
+    expect_int(tmp_files(b), 0);
+    unlink_db(a);
+    unlink_db(b);
 }
 END_TEST
 
@@ -358,7 +480,7 @@ START_TEST(test_atomic_owner)
     const char *path = NTEST_TMPPATH("tndb-atomic-owner.db");
     struct stat sb;
 
-    unlink(path);
+    unlink_db(path);
     fchown_calls = 0;
     write_db(path, "old");
     expect_int(fchown_calls, 0);        /* a new file is the writer's */
@@ -373,7 +495,7 @@ START_TEST(test_atomic_owner)
     write_db(path, "newest");
     expect_db(path, "newest");
 
-    unlink(path);
+    unlink_db(path);
     write_db(path, "old");
     fchown_errno = EIO;
     expect_failed_rewrite(path);
@@ -381,7 +503,7 @@ START_TEST(test_atomic_owner)
 
     expect_db(path, "old");
     expect_int(tmp_files(path), 0);
-    unlink(path);
+    unlink_db(path);
 }
 END_TEST
 
@@ -406,7 +528,7 @@ START_TEST(test_atomic_group)
         return;
     }
 
-    unlink(path);
+    unlink_db(path);
     write_db(path, "old");
     fail_if(chown(path, (uid_t)-1, gid) != 0, "cannot chgrp %s", path);
     write_db(path, "new");
@@ -414,7 +536,7 @@ START_TEST(test_atomic_group)
 
     fail_if(stat(path, &sb) != 0, "cannot stat %s", path);
     expect_int((int)sb.st_gid, (int)gid);
-    unlink(path);
+    unlink_db(path);
 }
 END_TEST
 
@@ -426,7 +548,7 @@ START_TEST(test_atomic_close_failure)
     int n;
 
     for (n = 1; n <= 2; n++) {
-        unlink(path);
+        unlink_db(path);
         write_db(path, "old");
 
         close_calls = 0;
@@ -440,7 +562,7 @@ START_TEST(test_atomic_close_failure)
         expect_db(path, "old");
         expect_int(tmp_files(path), 0);
     }
-    unlink(path);
+    unlink_db(path);
 }
 END_TEST
 
@@ -470,7 +592,7 @@ START_TEST(test_atomic_copy_fallback)
         val[i] = (char)('a' + (i % 26));
 
     for (mode = 1; mode <= CFR_MODES + 1; mode++) {
-        unlink(path);
+        unlink_db(path);
 
         short_writes = mode > CFR_MODES;
         write_calls = 0;
@@ -497,7 +619,7 @@ START_TEST(test_atomic_copy_fallback)
         expect_int(tndb_close(db), 1);
     }
 
-    unlink(path);
+    unlink_db(path);
     free(val);
     free(got);
 }
@@ -517,7 +639,7 @@ START_TEST(test_atomic_copy_failure)
     fail_if(val == NULL, "out of memory");
     memset(val, 'x', len);
 
-    unlink(path);
+    unlink_db(path);
     write_db(path, "old");
 
     cfr_mode = 3;
@@ -531,7 +653,7 @@ START_TEST(test_atomic_copy_failure)
 
     expect_db(path, "old");
     expect_int(tmp_files(path), 0);
-    unlink(path);
+    unlink_db(path);
     free(val);
 #endif
 }
@@ -540,6 +662,8 @@ END_TEST
 NTEST_RUNNER("tndb-atomic",
              test_atomic_write,
              test_atomic_mode,
+             test_atomic_symlink,
+             test_atomic_symlink_loop,
              test_atomic_owner,
              test_atomic_group,
              test_atomic_flush_failure,

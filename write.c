@@ -86,6 +86,59 @@ static int open_tmpfile(char *tmpath, size_t size, const char *path)
     return fd;
 }
 
+#define SYMLINKS_MAX 40         /* Linux's MAXSYMLINKS */
+
+/* the file a write to path ends up in, as open(..., O_CREAT) would find
+   it: the symlinks of the last component followed, a dangling one to its
+   (new) target; the directories are left as they are, rename() works
+   through them */
+static int resolve_target(const char *path, char *out, size_t size)
+{
+    char        link[PATH_MAX], tmp[PATH_MAX];
+    struct stat st;
+    const char  *slash;
+    ssize_t     len;
+    int         n, depth;
+
+    if ((size_t)snprintf(out, size, "%s", path) >= size)
+        goto l_toolong;
+
+    for (depth = 0; depth < SYMLINKS_MAX; depth++) {
+        if (lstat(out, &st) != 0)
+            return errno == ENOENT ? 0 : -1; /* a new file */
+
+        if (!S_ISLNK(st.st_mode))
+            return 0;
+
+        if ((len = readlink(out, link, sizeof(link))) == -1)
+            return -1;
+
+        if ((size_t)len >= sizeof(link)) /* cut */
+            goto l_toolong;
+        link[len] = '\0';
+
+        /* a relative target is relative to the link's directory */
+        slash = strrchr(out, '/');
+        if (link[0] == '/' || slash == NULL)
+            n = snprintf(tmp, sizeof(tmp), "%s", link);
+        else
+            n = snprintf(tmp, sizeof(tmp), "%.*s%s",
+                         (int)(slash - out + 1), out, link);
+
+        if (n < 0 || (size_t)n >= sizeof(tmp) || (size_t)n >= size)
+            goto l_toolong;
+
+        memcpy(out, tmp, (size_t)n + 1);
+    }
+
+    errno = ELOOP;
+    return -1;
+
+ l_toolong:
+    errno = ENAMETOOLONG;
+    return -1;
+}
+
 struct tndb *tndb_creat(const char *name, int comprlevel, unsigned flags)
 {
     char                path[PATH_MAX], mode[32] = "wb";
@@ -394,7 +447,7 @@ static int append_body(int fdin, int fdout)
 
 static int tndbw_close(struct tndb *db)
 {
-    char   tmpath[PATH_MAX + 16];
+    char   tmpath[PATH_MAX + 16], target[PATH_MAX];
     int    fdin = -1, fdout = -1, type, rc;
 
     rc = 0;
@@ -415,7 +468,11 @@ static int tndbw_close(struct tndb *db)
     }
     db->st = NULL;
 
-    if ((fdout = open_tmpfile(tmpath, sizeof(tmpath), db->path)) == -1)
+    /* through a symlink the target is replaced, not the link */
+    if (resolve_target(db->path, target, sizeof(target)) != 0)
+        goto l_end;
+
+    if ((fdout = open_tmpfile(tmpath, sizeof(tmpath), target)) == -1)
         goto l_end;
 
     if ((db->st = n_stream_dopen(fdout, "wb", type)) == NULL)
@@ -462,7 +519,7 @@ static int tndbw_close(struct tndb *db)
 
     /* written 0600 and owned by the writer until now; the rename() is what
        makes the file visible with these */
-    if (!setperms(fdout, db->path))
+    if (!setperms(fdout, target))
         goto l_end;
 
     if (close(fdout) != 0) {    /* the body is on disk now or never */
@@ -471,7 +528,7 @@ static int tndbw_close(struct tndb *db)
     }
     fdout = -1;
 
-    if (rename(tmpath, db->path) != 0)
+    if (rename(tmpath, target) != 0)
         goto l_end;
 
     rc = 1;
