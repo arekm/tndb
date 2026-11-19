@@ -88,6 +88,42 @@ START_TEST(test_put_key_too_long)
 }
 END_TEST
 
+/* as the package index of poldek, which is iterated */
+START_TEST(test_get_without_hash_table)
+{
+    char *path = NTEST_TMPPATH("tndb_die_nohash.db");
+    char key[TNDB_KEY_MAX + 1], buf[16];
+    unsigned int klen, vlen;
+    struct tndb_it it;
+    struct tndb *db;
+    uint32_t voff;
+
+    unlink(path);
+    db = tndb_creat(path, -1, TNDB_NOHASH);
+    expect_notnull(db);
+    expect_int(tndb_put(db, "a", 1, "value", 5), 1);
+    expect_int(tndb_close(db), 1);
+
+    set_returning_die_hook();
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_get_voff(db, "a", 1, &voff, &vlen), -1);
+    expect_int(ndies, 1);
+    fail_unless(strstr(die_msg, "without hash table") != NULL, "got '%s'", die_msg);
+
+    vlen = sizeof(buf);
+    expect_int(tndb_it_start(db, &it), 1);
+    expect_int(tndb_it_get(&it, key, &klen, buf, &vlen), 1);
+    expect_str(key, "a");
+    expect_str(buf, "value");
+    vlen = sizeof(buf);
+    expect_int(tndb_it_get(&it, key, &klen, buf, &vlen), 0);   /* the end */
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+END_TEST
+
 NTEST_RUNNER("tndb-die-hook",
              test_get_key_too_long,
-             test_put_key_too_long);
+             test_put_key_too_long,
+             test_get_without_hash_table);
