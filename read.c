@@ -489,6 +489,15 @@ static int read_vlen(tn_stream *st, uint32_t offs, uint8_t klen,
     return 1;
 }
 
+/* moves the stream to off, the end of a value it skips; 0 if the file ends
+   before it, which a seek alone does not tell */
+static int skip_to(tn_stream *st, uint32_t off)
+{
+    unsigned char c;
+
+    return n_stream_seek(st, off - 1, SEEK_SET) != -1 && n_stream_read(st, &c, 1) == 1;
+}
+
 int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
                   uint32_t *voffs, unsigned int *vlen)
 {
@@ -785,6 +794,7 @@ int tndb_it_get_begin(struct tndb_it *it, void *key, unsigned int *klen,
 int tndb_it_get_end(struct tndb_it *it)
 {
     uint32_t off = n_stream_tell(it->_db->st);
+    int rc = 1;
 
     if (off > it->_off) {
         n_die("tndb_it_get_end: current offset is %u, expected %u\n", off,
@@ -793,12 +803,12 @@ int tndb_it_get_end(struct tndb_it *it)
     }
 
     if (off < it->_off)
-        n_stream_seek(it->_db->st, it->_off, SEEK_SET);
+        rc = skip_to(it->_db->st, it->_off);
 
     n_assert(it->_get_flag > 0);
     it->_get_flag = 0;
 
-    return 1;
+    return rc;
 }
 
 int tndb_read(struct tndb *db, long offs, void *buf, unsigned int size)

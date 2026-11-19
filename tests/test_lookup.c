@@ -634,6 +634,51 @@ START_TEST(test_iterator_header_past_offsets)
 }
 END_TEST
 
+/* tndb_it_get_end() skips a value the caller did not read; in a file cut
+   inside the last value the skip fails, though a seek past the end does not */
+START_TEST(test_iterator_get_end_skip)
+{
+    char *path = NTEST_TMPPATH("tndb_it_end.db");
+    char key[TNDB_KEY_MAX + 1];
+    unsigned int klen, vlen;
+    uint32_t cvoff;
+    struct tndb_it it;
+    struct tndb *db;
+    int n, rc;
+
+    unlink(path);
+    db = tndb_creat(path, -1, 0);
+    expect_notnull(db);
+    expect_int(tndb_put(db, "a", 1, "x", 1), 1);
+    expect_int(tndb_put(db, "b", 1, "y", 1), 1);
+    expect_int(tndb_put(db, "c", 1, "zzzzzz", 6), 1);
+    expect_int(tndb_close(db), 1);
+
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_get_voff(db, "c", 1, &cvoff, &vlen), 1);
+    expect_int(tndb_it_start(db, &it), 1);
+    for (n = 0; tndb_it_get_begin(&it, key, &klen, &vlen); n++) {
+        rc = tndb_it_get_end(&it);
+        expect_int(rc, 1);
+    }
+    expect_int(n, 3);
+    expect_int(tndb_close(db), 1);
+
+    expect_int(truncate(path, cvoff + 3), 0);
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_it_start(db, &it), 1);
+    for (n = 0; tndb_it_get_begin(&it, key, &klen, &vlen); n++) {
+        rc = tndb_it_get_end(&it);
+        expect_int(rc, n < 2);
+    }
+    expect_int(n, 3);
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+END_TEST
+
 NTEST_RUNNER("tndb-lookup",
              test_get_all,
              test_get_str,
@@ -647,5 +692,6 @@ NTEST_RUNNER("tndb-lookup",
              test_lookup_value_past_offsets,
              test_lookup_header_past_offsets,
              test_iterator_value_past_offsets,
-             test_iterator_header_past_offsets
+             test_iterator_header_past_offsets,
+             test_iterator_get_end_skip
 );

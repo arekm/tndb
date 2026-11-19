@@ -122,6 +122,8 @@ EXPORT int tndb_it_get_voff(struct tndb_it *it, void *key, unsigned int *klen,
 /* for reading directly from db's stream */
 EXPORT int tndb_it_get_begin(struct tndb_it *it, void *key, unsigned int *klen,
             		     unsigned int *vlen);
+/* skips what the caller did not read of the value; 0 if the file ends
+   before the value does */
 EXPORT int tndb_it_get_end(struct tndb_it *it);
 
 
