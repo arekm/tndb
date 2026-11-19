@@ -183,6 +183,8 @@ START_TEST(test_corrupted_database)
     char *key = "signed_key";
     char *val = "signed_value";
     char *path = NTEST_TMPPATH("tndb_corrupted.db");
+    unsigned int vlen;
+    uint32_t voffs;
     FILE *fp;
     long filesize;
 
@@ -215,6 +217,9 @@ START_TEST(test_corrupted_database)
 
     /* Verify should fail for corrupted database */
     expect_int(tndb_verify(db), 0);
+
+    /* a lookup fails, rather than finds no such key */
+    expect_int(tndb_get_voff(db, key, strlen(key), &voffs, &vlen), -1);
     expect_int(tndb_close(db), 1);
     unlink(path);
 }

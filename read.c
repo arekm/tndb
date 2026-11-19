@@ -520,7 +520,7 @@ int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
     *vlen = 0;
 
     if (!verify_db(db))
-        return 0;
+        return -1;
 
     if (db->hdr.flags & TNDB_NOHASH) {
         n_die("tndb: method not allowed on file without hash table\n");
