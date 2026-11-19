@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 
 #include <trurl/narray.h>
@@ -382,14 +383,41 @@ END_TEST
 /* records whose value length, or also key, runs past the last offset */
 static const uint32_t hdr_offs[] = { UINT32_MAX - 2, UINT32_MAX };
 
-static void write_at(const char *path, off_t offs, const void *buf, size_t n)
-{
-    FILE *fp = fopen(path, "r+b");
+/* check has no skip: a case the environment cannot run passes, so at least
+   name the case and the reason in the log (NTEST_LOG prints only with -vv);
+   errno is kept for a %m in the message */
+#define SKIP(...)                                             \
+    do {                                                      \
+        int e_ = errno;                                       \
+        fprintf(stderr, "[%s] skipped: ", tcase_name());      \
+        errno = e_;                                           \
+        fprintf(stderr, __VA_ARGS__);                         \
+        fflush(stderr);                                       \
+    } while (0)
 
-    expect_notnull(fp);
-    expect_int(fseeko(fp, offs, SEEK_SET), 0);
-    expect_int(fwrite(buf, 1, n, fp), n);
-    expect_int(fclose(fp), 0);
+/* the size of the sparse file of the cases past the last offset */
+#define SPARSE_SIZE ((uint64_t)UINT32_MAX + 8)
+
+/* writes n bytes at offs; 0 on failure, with errno of the step that failed,
+   so that a case that needs an environment the file system cannot give
+   skips rather than fails */
+static int write_at(const char *path, off_t offs, const void *buf, size_t n)
+{
+    FILE *fp;
+    int ok, e;
+
+    if ((fp = fopen(path, "r+b")) == NULL)
+        return 0;
+
+    ok = fseeko(fp, offs, SEEK_SET) == 0 && fwrite(buf, 1, n, fp) == n;
+    e = errno;
+    if (fclose(fp) != 0) {
+        if (ok)                 /* the write fails only at the flush */
+            e = errno;
+        ok = 0;
+    }
+    errno = e;
+    return ok;
 }
 
 static void put_be32(unsigned char *b, uint32_t v)
@@ -400,6 +428,16 @@ static void put_be32(unsigned char *b, uint32_t v)
 static uint32_t get_be32(const unsigned char *b)
 {
     return (uint32_t)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3];
+}
+
+/* the first byte of the guard a reader changed, or -1; one assertion for
+   the whole guard, not one per byte, which floods the test framework */
+static int guard_at(const char *buf, size_t from, size_t to)
+{
+    for (size_t j = from; j < to; j++)
+        if (buf[j] != 'g')
+            return (int)j;
+    return -1;
 }
 
 /* key "a" with the value "value", then key "b" with REST_SIZE bytes; the
@@ -427,22 +465,41 @@ static uint32_t creat_with_vlen(const char *path, uint32_t len)
 
     if (len != 5) {
         put_be32(be, len);
-        write_at(path, voff - sizeof(be), be, sizeof(be));
+        fail_unless(write_at(path, voff - sizeof(be), be, sizeof(be)),
+                    "cannot write the value length at %u",
+                    voff - (uint32_t)sizeof(be));
     }
     return voff;
 }
 
 /* a sparse file up to past the last offset, with the key length and key
-   "a" of a record at offs; 0 if the file system cannot hold it */
+   "a" of a record at offs; 0 when the environment cannot hold such a file,
+   which skips the case rather than failing the code under test */
 static int extend_with_record_at(const char *path, uint32_t offs)
 {
     static const unsigned char rec[] = { 1, 'a' };
+    struct rlimit rl;
 
-    if (truncate(path, (off_t)UINT32_MAX + 8) != 0) {
-        fprintf(stderr, "%s: %m, skipped\n", path);
+    /* a write or truncate past RLIMIT_FSIZE raises SIGXFSZ, whose default
+       action ends the process, instead of failing the call: check it up
+       front, for the size of the file, which ends past the record */
+    if (getrlimit(RLIMIT_FSIZE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+        SPARSE_SIZE > (uint64_t)rl.rlim_cur) {
+        SKIP("RLIMIT_FSIZE is %llu, the file needs %llu bytes\n",
+             (unsigned long long)rl.rlim_cur, (unsigned long long)SPARSE_SIZE);
         return 0;
     }
-    write_at(path, offs, rec, sizeof(rec));
+
+    if (truncate(path, (off_t)SPARSE_SIZE) != 0) {
+        SKIP("cannot extend %s past the last offset: %m\n", path);
+        return 0;
+    }
+
+    if (!write_at(path, offs, rec, sizeof(rec))) {
+        SKIP("cannot write a record at %u: %m\n", offs);
+        return 0;
+    }
+
     return 1;
 }
 
@@ -527,15 +584,18 @@ START_TEST(test_lookup_header_past_offsets)
                     unsigned char be[4];
 
                     put_be32(be, hdr_offs[k]);
-                    write_at(path, at, be, sizeof(be));
+                    fail_unless(write_at(path, at, be, sizeof(be)),
+                                "cannot write the offset at %u", at);
                     n++;
                 }
             }
         }
         expect_int(n, 1);
 
-        if (!extend_with_record_at(path, hdr_offs[k]))
+        if (!extend_with_record_at(path, hdr_offs[k])) {
+            unlink(path);
             return;
+        }
 
         db = tndb_open(path);
         expect_notnull(db);
@@ -562,7 +622,7 @@ START_TEST(test_iterator_value_past_offsets)
     /* the record as written, 0xffffffff, and one byte past the last offset */
     uint32_t lens[] = { 5, UINT32_MAX, UINT32_MAX - voff0 + 1 };
     for (unsigned i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
-        int found = lens[i] == 5;
+        int found = lens[i] == 5, j;
 
         creat_with_vlen(path, lens[i]);
         db = tndb_open(path);
@@ -574,8 +634,8 @@ START_TEST(test_iterator_value_past_offsets)
         expect_int(tndb_it_get(&it, key, &klen, buf, &vlen), found);
         if (found)
             expect_str(buf, "value");
-        for (int j = BUFSIZE; j < BUFSIZE + GUARDSIZE; j++)
-            fail_unless(buf[j] == 'g', "tndb_it_get() wrote past the buffer at %d", j);
+        j = guard_at(buf, BUFSIZE, BUFSIZE + GUARDSIZE);
+        fail_unless(j < 0, "tndb_it_get() wrote past the buffer at %d", j);
 
         /* same block, so a write past the given size stays in it */
         memset(buf, 'g', BUFSIZE + GUARDSIZE);
@@ -586,8 +646,8 @@ START_TEST(test_iterator_value_past_offsets)
         fail_unless(rbuf == buf, "tndb_it_rget() reallocated the buffer");
         if (found)
             expect_str(buf, "value");
-        for (int j = BUFSIZE; j < BUFSIZE + GUARDSIZE; j++)
-            fail_unless(buf[j] == 'g', "tndb_it_rget() wrote past the buffer at %d", j);
+        j = guard_at(buf, BUFSIZE, BUFSIZE + GUARDSIZE);
+        fail_unless(j < 0, "tndb_it_rget() wrote past the buffer at %d", j);
 
         expect_int(tndb_it_start(db, &it), 1);
         expect_int(tndb_it_get_begin(&it, key, &klen, &vlen), found);
@@ -622,8 +682,10 @@ START_TEST(test_iterator_header_past_offsets)
     voff0 = creat_with_vlen(path, 5);
     for (unsigned k = 0; k < sizeof(hdr_offs) / sizeof(hdr_offs[0]); k++) {
         creat_with_vlen(path, hdr_offs[k] - voff0);
-        if (!extend_with_record_at(path, hdr_offs[k]))
+        if (!extend_with_record_at(path, hdr_offs[k])) {
+            unlink(path);
             return;
+        }
 
         db = tndb_open(path);
         expect_notnull(db);
@@ -771,7 +833,7 @@ START_TEST(test_iterator_done)
     /* the size of the buffer is kept, so once the rest of the value is
        there the same call reads it */
     expect_int(vlen, sizeof(buf));
-    write_at(path, cvoff + 3, "zzz", 3);
+    fail_unless(write_at(path, cvoff + 3, "zzz", 3), "cannot write the value");
     expect_int(tndb_it_get(&it, key, &klen, buf, &vlen), 1);
     expect_str(key, "c");
     expect_str(buf, "zzzzzz");
