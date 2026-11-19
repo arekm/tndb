@@ -95,7 +95,7 @@ struct tndb_it {
     struct tndb  *_db;
     uint32_t     _nrec;
     uint32_t     _off;
-    int          _get_flag;     /* for get_(begin/end) */
+    int          _state;        /* on a record, in its value, or broken */
 };
 
 #define tndb_it_stream(db) ((db)->st)
@@ -104,9 +104,15 @@ struct tndb_it {
 EXPORT int tndb_it_start(struct tndb *db, struct tndb_it *it);
 
 /*
+  readers: 1 for a record, 0 at the end, -1 for a broken record (EBADMSG);
+  -1 ends the iteration, a reader called after it calls n_die()
+ */
+
+/*
   key size must be at least TNDB_KEY_MAX + 1 bytes
   if key is NULL then keys are not retrieved
-  *vlen is the size of val, and the length of the value once it is read
+  *vlen is the size of val, then the length of the value;
+  -1 with ERANGE if the value does not fit (see tndb_it_rget())
  */
 EXPORT int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
 		       void *val, unsigned int *vlen);
@@ -115,25 +121,18 @@ EXPORT int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
 EXPORT int tndb_it_rget(struct tndb_it *it, void *key, unsigned int *klen,
 	                void **val, unsigned int *vlen);
 
-/* 1 for a record; 0 after the last one, and for a record that cannot be
-   read or that ends past the 32-bit offsets of the file */
 EXPORT int tndb_it_get_voff(struct tndb_it *it, void *key, unsigned int *klen,
                 	    uint32_t *voff, unsigned int *vlen);
 
 /* for reading directly from db's stream */
 EXPORT int tndb_it_get_begin(struct tndb_it *it, void *key, unsigned int *klen,
             		     unsigned int *vlen);
-/* skips what the caller did not read of the value; 0 if the file ends
-   before the value does */
+/* skips the rest of the value; 0 if the file ends before it, which ends
+   the iteration */
 EXPORT int tndb_it_get_end(struct tndb_it *it);
 
-/* 1 once every record has been returned and the file holds the last
-   value; 0 while some are left, as after a reader returned 0 for one that
-   cannot be read, and between tndb_it_get_begin() and tndb_it_get_end().
-   It reads the stream to check a last value that was only skipped. */
-EXPORT int tndb_it_done(const struct tndb_it *it);
 
-
+/* NULL for a broken database */
 EXPORT tn_array *tndb_keys(struct tndb *db);
 
 /* number of records */
