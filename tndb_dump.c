@@ -78,11 +78,16 @@ int do_walk(const char *name, unsigned flags)
         printf("KEY = %s\n", key);
         if (flags & DUMP_DATA) {
             unsigned char *buf;
-            int i;
+            int i, n;
 
             buf = n_malloc(vlen + 1);
-            if (tndb_read(db, voffs, buf, vlen) != (int)vlen) {
-                fprintf(stderr, "%s: %m\n", name);
+            if ((n = tndb_read(db, voffs, buf, vlen)) != (int)vlen) {
+                /* the end of the file leaves errno as it was */
+                if (n < 0)
+                    fprintf(stderr, "%s: %s: cannot read the value\n", name, key);
+                else
+                    fprintf(stderr, "%s: %s: read %d of %u bytes of the value\n",
+                            name, key, n, vlen);
                 return -1;
             }
             buf[vlen] = '\0';
