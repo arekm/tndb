@@ -241,7 +241,7 @@ int read_eq(const struct tndb *db, const uint32_t offs,
 static int htt_read(struct tndb *db)
 {
     int i, j;
-    uint32_t ht_offsets[TNDB_HTSIZE];
+    uint32_t ht_offsets[TNDB_HTSIZE], nleft;
 
     /* read ht entries offsets first to avoid backward file seek */
 
@@ -259,6 +259,12 @@ static int htt_read(struct tndb *db)
         ht_offsets[i] = ht_offs;
     }
 
+    /* offsets, a size per table, then 8 bytes an entry up to the data */
+    if (db->hdr.doffs < db->offs.htt + 2 * TNDB_HTBYTESIZE)
+        return 0;
+    nleft = (db->hdr.doffs - db->offs.htt - 2 * TNDB_HTBYTESIZE) /
+        (2 * sizeof(uint32_t));
+
     for (i=0; i < TNDB_HTSIZE; i++) {
         tn_array *ht = db->htt[i];
         uint32_t ht_size;
@@ -271,11 +277,13 @@ static int htt_read(struct tndb *db)
         if (!nn_stream_read_uint32_offs(db->st, &ht_size, ht_offs))
             return 0;
 
-        if (ht_size == 0) {
-            DBGF("empty!? %d\n", i);
-            n_assert(0);
-            continue;
+        /* tndb points at no table of size 0: a file that does, or that
+           has more entries than room for them, is broken */
+        if (ht_size == 0 || ht_size > nleft) {
+            DBGF("table %d: size %u, room for %u\n", i, ht_size, nleft);
+            return 0;
         }
+        nleft -= ht_size;
 
         if (ht == NULL) {
             ht = n_array_new(ht_size, tndb_hent_free, (tn_fn_cmp)tndb_hent_cmp);

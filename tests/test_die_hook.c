@@ -236,8 +236,56 @@ START_TEST(test_get_hash_table_broken)
 }
 END_TEST
 
+/* the size of a hash table from the second half set in the file; each
+   lookup is to report the file broken and fail */
+static void check_table_size(const char *path, uint32_t size)
+{
+    uint32_t entry, table;
+    struct tndb *db;
+    int nfound, nfailed;
+
+    creat_with_tables(path, &entry, &table);
+    write_be32(path, table, size);
+
+    set_returning_die_hook();
+    db = tndb_open(path);
+    expect_notnull(db);
+    get_keys(db, &nfound, &nfailed);
+    fail_unless(nfound == 0 && nfailed == NREC && ndies == NREC,
+                "size %u: %d found, %d failed, %d messages",
+                size, nfound, nfailed, ndies);
+    fail_unless(strstr(die_msg, "htt_read failed") != NULL, "got '%s'", die_msg);
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+
+/* tndb points at no hash table of size 0 */
+START_TEST(test_get_hash_table_size_0)
+{
+    check_table_size(NTEST_TMPPATH("tndb_die_htsize0.db"), 0);
+}
+END_TEST
+
+/* nor at one with more entries than the file has room for: NREC in all */
+START_TEST(test_get_hash_table_size_too_large)
+{
+    check_table_size(NTEST_TMPPATH("tndb_die_htsizebig.db"), NREC + 1);
+}
+END_TEST
+
+/* and a size from the file is not taken for the number of entries to
+   allocate */
+START_TEST(test_get_hash_table_size_max)
+{
+    check_table_size(NTEST_TMPPATH("tndb_die_htsizemax.db"), UINT32_MAX);
+}
+END_TEST
+
 NTEST_RUNNER("tndb-die-hook",
              test_get_key_too_long,
              test_put_key_too_long,
              test_get_without_hash_table,
-             test_get_hash_table_broken);
+             test_get_hash_table_broken,
+             test_get_hash_table_size_0,
+             test_get_hash_table_size_too_large,
+             test_get_hash_table_size_max);
