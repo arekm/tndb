@@ -13,6 +13,7 @@
 #include <trurl/nmalloc.h>
 #include <trurl/n_snprintf.h>
 #include <trurl/n_check.h>
+#include <trurl/ndie.h>
 
 #include "tndb.h"
 
@@ -597,6 +598,9 @@ START_TEST(test_iterator_value_past_offsets)
         expect_int(tndb_it_start(db, &it), 1);
         expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), found);
         expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), found);
+        expect_int(tndb_it_done(&it), found);
+        if (!found)
+            expect_null(tndb_keys(db));
 
         expect_int(tndb_close(db), 1);
     }
@@ -628,6 +632,7 @@ START_TEST(test_iterator_header_past_offsets)
         expect_int(voff, voff0);
         expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), 0);
         expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), 0);
+        expect_int(tndb_it_done(&it), 0);
         expect_int(tndb_close(db), 1);
     }
     unlink(path);
@@ -679,6 +684,168 @@ START_TEST(test_iterator_get_end_skip)
 }
 END_TEST
 
+/* tndb_it_done() tells a database read to its end from one whose records
+   stop being readable on the way, as when the file is cut short */
+START_TEST(test_iterator_done)
+{
+    char *path = NTEST_TMPPATH("tndb_it_done.db");
+    char key[TNDB_KEY_MAX + 1], buf[16];
+    unsigned int klen, vlen;
+    uint32_t voff, cvoff;
+    struct tndb_it it;
+    struct tndb *db;
+    tn_array *keys;
+    void *rbuf;
+    int n, rc;
+
+    unlink(path);
+    db = tndb_creat(path, -1, 0);
+    expect_notnull(db);
+    expect_int(tndb_put(db, "a", 1, "x", 1), 1);
+    expect_int(tndb_put(db, "b", 1, "y", 1), 1);
+    expect_int(tndb_put(db, "c", 1, "zzzzzz", 6), 1);
+    expect_int(tndb_close(db), 1);
+
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_get_voff(db, "c", 1, &cvoff, &vlen), 1);
+    expect_int(tndb_it_start(db, &it), 1);
+    expect_int(tndb_it_done(&it), 0);
+    for (n = 0; tndb_it_get_voff(&it, key, &klen, &voff, &vlen); n++)
+        ;
+    expect_int(n, 3);
+    expect_int(tndb_it_done(&it), 1);
+    keys = tndb_keys(db);
+    expect_notnull(keys);
+    expect_int(n_array_size(keys), 3);
+    n_array_free(keys);
+
+    /* a record between tndb_it_get_begin() and tndb_it_get_end() is not done */
+    expect_int(tndb_it_start(db, &it), 1);
+    for (n = 0; tndb_it_get_begin(&it, key, &klen, &vlen); n++) {
+        expect_int(tndb_it_done(&it), 0);
+        rc = tndb_it_get_end(&it);
+        expect_int(rc, 1);
+    }
+    expect_int(n, 3);
+    expect_int(tndb_it_done(&it), 1);
+    expect_int(tndb_close(db), 1);
+
+    /* cut in the value of "c": the readers of values stop before it, the
+       others return it, and none of them is done */
+    expect_int(truncate(path, cvoff + 3), 0);
+    db = tndb_open(path);
+    expect_notnull(db);
+
+    expect_int(tndb_it_start(db, &it), 1);
+    rbuf = NULL;
+    vlen = 0;
+    for (n = 0; tndb_it_rget(&it, key, &klen, &rbuf, &vlen); n++)
+        ;
+    free(rbuf);
+    expect_int(n, 2);
+    expect_int(tndb_it_done(&it), 0);
+
+    expect_int(tndb_it_start(db, &it), 1);
+    for (n = 0; tndb_it_get_voff(&it, key, &klen, &voff, &vlen); n++)
+        ;
+    expect_int(n, 3);
+    expect_int(tndb_it_done(&it), 0);
+    expect_null(tndb_keys(db));
+
+    expect_int(tndb_it_start(db, &it), 1);
+    for (n = 0; tndb_it_get_begin(&it, key, &klen, &vlen); n++)
+        tndb_it_get_end(&it);
+    expect_int(n, 3);
+    expect_int(tndb_it_done(&it), 0);
+
+    expect_int(tndb_it_start(db, &it), 1);
+    n = 0;
+    vlen = sizeof(buf);
+    while (tndb_it_get(&it, key, &klen, buf, &vlen)) {
+        n++;
+        vlen = sizeof(buf);
+    }
+    expect_int(n, 2);
+    expect_int(tndb_it_done(&it), 0);
+    /* the size of the buffer is kept, so once the rest of the value is
+       there the same call reads it */
+    expect_int(vlen, sizeof(buf));
+    write_at(path, cvoff + 3, "zzz", 3);
+    expect_int(tndb_it_get(&it, key, &klen, buf, &vlen), 1);
+    expect_str(key, "c");
+    expect_str(buf, "zzzzzz");
+    expect_int(tndb_it_done(&it), 1);
+    expect_int(tndb_close(db), 1);
+
+    /* cut in the value length of "c": all of them, and tndb_keys() */
+    expect_int(truncate(path, cvoff - 2), 0);
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_it_start(db, &it), 1);
+    for (n = 0; tndb_it_get_voff(&it, key, &klen, &voff, &vlen); n++)
+        ;
+    expect_int(n, 2);
+    expect_int(tndb_it_done(&it), 0);
+    expect_null(tndb_keys(db));
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+END_TEST
+
+static int die_calls;
+
+static void returning_die_hook(const char *msg)
+{
+    (void)msg;
+    die_calls++;
+}
+
+/* a value longer than the caller's buffer, when the die hook returns: the
+   iterator stays on it, so that a larger buffer reads it */
+START_TEST(test_iterator_get_small_buffer)
+{
+    char *path = NTEST_TMPPATH("tndb_it_small.db");
+    char key[TNDB_KEY_MAX + 1], buf[16];
+    unsigned int klen, vlen;
+    t_fn_die_hook old_hook;
+    struct tndb_it it;
+    struct tndb *db;
+    int rc;
+
+    unlink(path);
+    db = tndb_creat(path, -1, 0);
+    expect_notnull(db);
+    expect_int(tndb_put(db, "a", 1, "x", 1), 1);
+    expect_int(tndb_put(db, "b", 1, "yyyyyyyy", 8), 1);
+    expect_int(tndb_close(db), 1);
+
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_it_start(db, &it), 1);
+    vlen = sizeof(buf);
+    expect_int(tndb_it_get(&it, key, &klen, buf, &vlen), 1);
+
+    old_hook = n_die_set_hook(returning_die_hook);
+    die_calls = 0;
+    vlen = 4;
+    rc = tndb_it_get(&it, key, &klen, buf, &vlen);
+    n_die_set_hook(old_hook);
+    expect_int(rc, 0);
+    expect_int(die_calls, 1);
+    expect_int(tndb_it_done(&it), 0);
+
+    vlen = sizeof(buf);
+    expect_int(tndb_it_get(&it, key, &klen, buf, &vlen), 1);
+    expect_str(key, "b");
+    expect_str(buf, "yyyyyyyy");
+    expect_int(tndb_it_done(&it), 1);
+
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+END_TEST
+
 NTEST_RUNNER("tndb-lookup",
              test_get_all,
              test_get_str,
@@ -693,5 +860,7 @@ NTEST_RUNNER("tndb-lookup",
              test_lookup_header_past_offsets,
              test_iterator_value_past_offsets,
              test_iterator_header_past_offsets,
-             test_iterator_get_end_skip
+             test_iterator_get_end_skip,
+             test_iterator_done,
+             test_iterator_get_small_buffer
 );

@@ -100,6 +100,11 @@ int do_walk(const char *name, unsigned flags)
             printf("DATA = %s\n\n--------------------------------------------------\n", buf);
         }
     }
+
+    if (!tndb_it_done(&it)) {
+        fprintf(stderr, "%s: tndb_it_get_voff failed\n", name);
+        return -1;
+    }
     return 0;
 }
 

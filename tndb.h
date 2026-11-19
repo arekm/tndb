@@ -106,6 +106,7 @@ EXPORT int tndb_it_start(struct tndb *db, struct tndb_it *it);
 /*
   key size must be at least TNDB_KEY_MAX + 1 bytes
   if key is NULL then keys are not retrieved
+  *vlen is the size of val, and the length of the value once it is read
  */
 EXPORT int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
 		       void *val, unsigned int *vlen);
@@ -125,6 +126,12 @@ EXPORT int tndb_it_get_begin(struct tndb_it *it, void *key, unsigned int *klen,
 /* skips what the caller did not read of the value; 0 if the file ends
    before the value does */
 EXPORT int tndb_it_get_end(struct tndb_it *it);
+
+/* 1 once every record has been returned and the file holds the last
+   value; 0 while some are left, as after a reader returned 0 for one that
+   cannot be read, and between tndb_it_get_begin() and tndb_it_get_end().
+   It reads the stream to check a last value that was only skipped. */
+EXPORT int tndb_it_done(const struct tndb_it *it);
 
 
 EXPORT tn_array *tndb_keys(struct tndb *db);

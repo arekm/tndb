@@ -652,6 +652,11 @@ tn_array *tndb_keys(struct tndb *db)
     while (tndb_it_get_voff(&it, key, &klen, &voffs, &vlen))
         n_array_push(keys, n_strdupl(key, klen));
 
+    if (!tndb_it_done(&it)) {
+        n_array_free(keys);
+        return NULL;
+    }
+
     return keys;
 }
 
@@ -726,6 +731,7 @@ int tndb_it_get_voff(struct tndb_it *it, void *key, unsigned int *klen,
 int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
                 void *val, unsigned int *avlen)
 {
+    struct tndb_it it0 = *it;
     uint32_t     voff;
     unsigned int vlen;
     int          rc = 0;
@@ -734,14 +740,17 @@ int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
         return 0;
 
     if ((vlen + 1) > *avlen) {
+        *it = it0;              /* a die hook may let us return */
         n_die("tndb: not enough space for data (%d > %d)\n", vlen, *avlen);
         return 0;
     }
 
-    *avlen = vlen;
     rc = (n_stream_read(it->_db->st, val, vlen) == (int)vlen);
-    if (rc)
+    if (rc) {
         ((char*)val)[vlen] = '\0';
+        *avlen = vlen;
+    } else
+        *it = it0;              /* stays on the record */
 
     return rc;
 }
@@ -749,6 +758,7 @@ int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
 int tndb_it_rget(struct tndb_it *it, void *key, unsigned int *klen,
                  void **val, unsigned int *avlen)
 {
+    struct tndb_it it0 = *it;
     uint32_t     voff;
     unsigned int vlen;
     int          rc = 0;
@@ -767,8 +777,24 @@ int tndb_it_rget(struct tndb_it *it, void *key, unsigned int *klen,
     rc = (n_stream_read(it->_db->st, *val, vlen) == (int)vlen);
     if (rc)
         ((char*)*val)[vlen] = '\0';
+    else
+        *it = it0;              /* stays on the record */
 
     return rc;
+}
+
+int tndb_it_done(const struct tndb_it *it)
+{
+    long pos;
+
+    if (it->_get_flag || it->_nrec != it->_db->hdr.nrec)
+        return 0;
+
+    /* the last value ends the data: a read of it leaves the stream there,
+       a value only skipped is checked (a backward seek of a compressed
+       stream reads it again from its start) */
+    pos = n_stream_tell(it->_db->st);
+    return (pos >= 0 && (uint64_t)pos == it->_off) || skip_to(it->_db->st, it->_off);
 }
 
 int tndb_it_get_begin(struct tndb_it *it, void *key, unsigned int *klen,
