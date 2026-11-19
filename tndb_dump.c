@@ -3,6 +3,7 @@
 #endif
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -49,7 +50,6 @@ int do_walk(const char *name, unsigned flags)
     struct tndb     *db;
     struct tndb_it  it;
     char            key[TNDB_KEY_MAX + 1];
-    int             rc;
     unsigned int    kn;
 
     if ((db = tndb_open(name)) == NULL) {
@@ -68,17 +68,18 @@ int do_walk(const char *name, unsigned flags)
         return -1;
     }
 
-    while ((rc = tndb_it_get_voff(&it, key, &kn, &voffs, &vlen))) {
-
-        if (rc < 0) {
-            fprintf(stderr, "%s: tndb_it_get_voff failed", name);
-            return -1;
-        }
-
+    while (tndb_it_get_voff(&it, key, &kn, &voffs, &vlen)) {
         printf("KEY = %s\n", key);
         if (flags & DUMP_DATA) {
             unsigned char *buf;
             int i, n;
+
+            /* tndb_read() returns the length read as an int */
+            if (vlen > INT_MAX) {
+                fprintf(stderr, "%s: %s: a value of %u bytes is too long to dump\n",
+                        name, key, vlen);
+                return -1;
+            }
 
             buf = n_malloc(vlen + 1);
             if ((n = tndb_read(db, voffs, buf, vlen)) != (int)vlen) {

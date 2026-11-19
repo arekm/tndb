@@ -600,7 +600,6 @@ tn_array *tndb_keys(struct tndb *db)
     unsigned        klen, vlen;
     tn_array        *keys;
     uint32_t        voffs;
-    int             rc;
 
 
     if (!verify_db(db))
@@ -610,14 +609,8 @@ tn_array *tndb_keys(struct tndb *db)
         return NULL;
 
     keys = n_array_new(db->hdr.nrec, free, (tn_fn_cmp)strcmp);
-    while ((rc = tndb_it_get_voff(&it, key, &klen, &voffs, &vlen))) {
-        if (rc < 0) {
-            n_array_free(keys);
-            return NULL;
-        }
-
+    while (tndb_it_get_voff(&it, key, &klen, &voffs, &vlen))
         n_array_push(keys, n_strdupl(key, klen));
-    }
 
     return keys;
 }
@@ -688,7 +681,7 @@ int tndb_it_get_voff(struct tndb_it *it, void *key, unsigned int *klen,
     it->_off += *vlen + sizeof(uint32_t);
     it->_nrec++;
     //DBGF("val[%d] (%d)\n", it->_offs, *vlen);
-    return *vlen;
+    return 1;
 }
 
 

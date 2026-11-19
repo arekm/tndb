@@ -112,6 +112,7 @@ EXPORT int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
 EXPORT int tndb_it_rget(struct tndb_it *it, void *key, unsigned int *klen,
 	                void **val, unsigned int *vlen);
 
+/* 1 for a record, 0 after the last one or when it cannot be read */
 EXPORT int tndb_it_get_voff(struct tndb_it *it, void *key, unsigned int *klen,
                 	    uint32_t *voff, unsigned int *vlen);
 

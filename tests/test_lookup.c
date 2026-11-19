@@ -309,6 +309,68 @@ START_TEST(test_get_voff)
 }
 END_TEST
 
+/* an empty value is a record like any other: iteration goes on past it */
+START_TEST(test_iterator_empty_value)
+{
+    static const char *keys[] = { "a", "b", "c" }, *vals[] = { "x", "", "y" };
+    char *path = NTEST_TMPPATH("tndb_it_empty.db");
+    char key[TNDB_KEY_MAX + 1], buf[16];
+    unsigned int klen, vlen;
+    void *rbuf = NULL;
+    struct tndb_it it;
+    struct tndb *db;
+    tn_array *dbkeys;
+    uint32_t voff;
+    int n;
+
+    unlink(path);
+    db = tndb_creat(path, -1, 0);
+    expect_notnull(db);
+    for (n = 0; n < 3; n++)
+        expect_int(tndb_put(db, keys[n], 1, vals[n], strlen(vals[n])), 1);
+    expect_int(tndb_close(db), 1);
+
+    db = tndb_open(path);
+    expect_notnull(db);
+
+    expect_int(tndb_it_start(db, &it), 1);
+    for (n = 0; tndb_it_get_voff(&it, key, &klen, &voff, &vlen) > 0; n++)
+        expect_int(vlen, strlen(vals[n]));
+    expect_int(n, 3);
+
+    expect_int(tndb_it_start(db, &it), 1);
+    n = 0;
+    vlen = sizeof(buf);
+    while (tndb_it_get(&it, key, &klen, buf, &vlen) > 0) {
+        expect_str(buf, vals[n++]);
+        vlen = sizeof(buf);
+    }
+    expect_int(n, 3);
+
+    expect_int(tndb_it_start(db, &it), 1);
+    vlen = 0;
+    for (n = 0; tndb_it_rget(&it, key, &klen, &rbuf, &vlen) > 0; n++)
+        expect_str(rbuf, vals[n]);
+    expect_int(n, 3);
+    free(rbuf);
+
+    expect_int(tndb_it_start(db, &it), 1);
+    for (n = 0; tndb_it_get_begin(&it, key, &klen, &vlen) > 0; n++) {
+        expect_int(vlen, strlen(vals[n]));
+        expect_int(tndb_it_get_end(&it), 1);
+    }
+    expect_int(n, 3);
+
+    dbkeys = tndb_keys(db);
+    expect_notnull(dbkeys);
+    expect_int(n_array_size(dbkeys), 3);
+    n_array_free(dbkeys);
+
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+END_TEST
+
 NTEST_RUNNER("tndb-lookup",
              test_get_all,
              test_get_str,
@@ -317,5 +379,6 @@ NTEST_RUNNER("tndb-lookup",
              test_max_key_length,
              test_iterator_rget,
              test_iterator_get,
-             test_get_voff
+             test_get_voff,
+             test_iterator_empty_value
 );
