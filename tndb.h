@@ -81,8 +81,9 @@ EXPORT size_t tndb_get_all(struct tndb *db, const void *key, size_t klen,
 EXPORT int tndb_get_str(struct tndb *db, const char *key,
 			unsigned char *val, unsigned int valsize);
 
-/* 1 if found, 0 if not, -1 for a record that cannot be read or that ends
-   past the 32-bit offsets of the file */
+/* 1 if found, 0 if not, -1 if the lookup cannot be made: a key longer
+   than TNDB_KEY_MAX, a record that cannot be read or that ends past the
+   32-bit offsets of the file */
 EXPORT int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
 			 uint32_t *voffs, unsigned int *vlen);
 

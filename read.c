@@ -526,8 +526,10 @@ int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
     *voffs = 0;
     *vlen = 0;
 
-    if (aklen > UINT8_MAX)
+    if (aklen > UINT8_MAX) {
         n_die("tndb: key too long (max is %d)\n", UINT8_MAX);
+        return -1;
+    }
 
     klen = aklen;
 
