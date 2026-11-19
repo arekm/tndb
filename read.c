@@ -521,8 +521,12 @@ int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
 
 
     if ((db->rtflags & TNDB_R_HTT_LOADED) == 0) {
-        if (!htt_read(db))
+        /* tables read in part stay unused until tndb_free() */
+        if ((db->rtflags & TNDB_R_HTT_BROKEN) || !htt_read(db)) {
+            db->rtflags |= TNDB_R_HTT_BROKEN;
             n_die("tndb: %p, htt_read failed\n", db);
+            return -1;
+        }
         //printf("tndb: %p, htt_read OK\n", db);
         db->rtflags |= TNDB_R_HTT_LOADED;
     }
