@@ -371,6 +371,269 @@ START_TEST(test_iterator_empty_value)
 }
 END_TEST
 
+/* A record is a key length, the key, a 32-bit value length and the value;
+   offsets in the file are 32-bit too. A record that ends past them comes
+   from a corrupted file and nothing is read for it: with a value length of
+   0xffffffff, vlen + 1 wrapped to 0 and the readers that size the caller's
+   buffer with it copied the rest of the file into it. */
+
+#define REST_SIZE (64 * 1024)
+/* records whose value length, or also key, runs past the last offset */
+static const uint32_t hdr_offs[] = { UINT32_MAX - 2, UINT32_MAX };
+
+static void write_at(const char *path, off_t offs, const void *buf, size_t n)
+{
+    FILE *fp = fopen(path, "r+b");
+
+    expect_notnull(fp);
+    expect_int(fseeko(fp, offs, SEEK_SET), 0);
+    expect_int(fwrite(buf, 1, n, fp), n);
+    expect_int(fclose(fp), 0);
+}
+
+static void put_be32(unsigned char *b, uint32_t v)
+{
+    b[0] = v >> 24; b[1] = v >> 16; b[2] = v >> 8; b[3] = v;
+}
+
+static uint32_t get_be32(const unsigned char *b)
+{
+    return (uint32_t)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3];
+}
+
+/* key "a" with the value "value", then key "b" with REST_SIZE bytes; the
+   value length of "a" set to len unless that is 5; returns its offset */
+static uint32_t creat_with_vlen(const char *path, uint32_t len)
+{
+    static char rest[REST_SIZE];
+    unsigned char be[4];
+    uint32_t voff = 0;
+    unsigned int vlen = 0;
+    struct tndb *db;
+
+    unlink(path);
+    db = tndb_creat(path, -1, 0);
+    expect_notnull(db);
+    expect_int(tndb_put(db, "a", 1, "value", 5), 1);
+    memset(rest, 'x', sizeof(rest));
+    expect_int(tndb_put(db, "b", 1, rest, sizeof(rest)), 1);
+    expect_int(tndb_close(db), 1);
+
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_get_voff(db, "a", 1, &voff, &vlen), 1);
+    expect_int(tndb_close(db), 1);
+
+    if (len != 5) {
+        put_be32(be, len);
+        write_at(path, voff - sizeof(be), be, sizeof(be));
+    }
+    return voff;
+}
+
+/* a sparse file up to past the last offset, with the key length and key
+   "a" of a record at offs; 0 if the file system cannot hold it */
+static int extend_with_record_at(const char *path, uint32_t offs)
+{
+    static const unsigned char rec[] = { 1, 'a' };
+
+    if (truncate(path, (off_t)UINT32_MAX + 8) != 0) {
+        fprintf(stderr, "%s: %m, skipped\n", path);
+        return 0;
+    }
+    write_at(path, offs, rec, sizeof(rec));
+    return 1;
+}
+
+START_TEST(test_lookup_value_past_offsets)
+{
+    char *path = NTEST_TMPPATH("tndb_vlen_lookup.db");
+    unsigned char buf[16];
+    unsigned int vlen;
+    uint32_t voff, voff0;
+    struct tndb *db;
+    void *val;
+
+    /* runs to the last offset: still a record */
+    voff0 = creat_with_vlen(path, 5);
+    creat_with_vlen(path, UINT32_MAX - voff0);
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_get_voff(db, "a", 1, &voff, &vlen), 1);
+    expect_int(voff, voff0);
+    fail_unless(vlen == UINT32_MAX - voff0, "value length %u", vlen);
+    expect_int(tndb_close(db), 1);
+
+    /* 0xffffffff, and one byte past the last offset */
+    uint32_t lens[] = { UINT32_MAX, UINT32_MAX - voff0 + 1 };
+    for (unsigned i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+        creat_with_vlen(path, lens[i]);
+        db = tndb_open(path);
+        expect_notnull(db);
+
+        expect_int(tndb_get_voff(db, "a", 1, &voff, &vlen), -1);
+        expect_int(tndb_get(db, "a", 1, buf, sizeof(buf)), 0);
+        val = NULL;
+        expect_int((int)tndb_get_all(db, "a", 1, &val), 0);
+        expect_null(val);
+
+        /* the record after it is still found */
+        val = NULL;
+        expect_int((int)tndb_get_all(db, "b", 1, &val), REST_SIZE);
+        free(val);
+
+        expect_int(tndb_close(db), 1);
+    }
+    unlink(path);
+}
+END_TEST
+
+/* the hash table points "a" at a record whose offsets, added in 32 bits,
+   wrap: those of its value, and at the last offset those of its key too,
+   which then is compared with the start of the file */
+START_TEST(test_lookup_header_past_offsets)
+{
+    char *path = NTEST_TMPPATH("tndb_hdr_lookup.db");
+    unsigned char head[4096];
+    uint32_t voff, recoff, htt;
+    unsigned int vlen;
+    struct tndb *db;
+    FILE *fp;
+
+    for (unsigned k = 0; k < sizeof(hdr_offs) / sizeof(hdr_offs[0]); k++) {
+        int n = 0;
+
+        voff = creat_with_vlen(path, 5);
+        recoff = voff - sizeof(uint32_t) - 1 - 1;
+        fail_unless(recoff <= sizeof(head), "first record at %u", recoff);
+
+        fp = fopen(path, "rb");
+        expect_notnull(fp);
+        expect_int(fread(head, 1, recoff, fp), recoff);
+        fclose(fp);
+
+        /* "tndb1.0\n", flags, signature block (its size first), timestamp,
+           number of records, offset of the first one, then the hash table:
+           offsets of 256 buckets, each its size and (hash, offset) pairs */
+        htt = 9 + (head[9] << 8 | head[10]) + 3 * sizeof(uint32_t);
+        for (int i = 0; i < 256; i++) {
+            uint32_t b = get_be32(head + htt + 4 * i);
+
+            for (uint32_t j = 0; b && j < get_be32(head + b); j++) {
+                uint32_t at = b + 4 + 8 * j + 4;
+
+                if (get_be32(head + at) == recoff) {
+                    unsigned char be[4];
+
+                    put_be32(be, hdr_offs[k]);
+                    write_at(path, at, be, sizeof(be));
+                    n++;
+                }
+            }
+        }
+        expect_int(n, 1);
+
+        if (!extend_with_record_at(path, hdr_offs[k]))
+            return;
+
+        db = tndb_open(path);
+        expect_notnull(db);
+        expect_int(tndb_get_voff(db, "a", 1, &voff, &vlen), -1);
+        expect_int(tndb_close(db), 1);
+    }
+    unlink(path);
+}
+END_TEST
+
+START_TEST(test_iterator_value_past_offsets)
+{
+    char *path = NTEST_TMPPATH("tndb_vlen_it.db");
+    char key[TNDB_KEY_MAX + 1];
+    unsigned int klen, vlen;
+    uint32_t voff, voff0;
+    struct tndb_it it;
+    struct tndb *db;
+    /* the readers are told the buffer is 16 bytes; the rest is a guard */
+    enum { BUFSIZE = 16, GUARDSIZE = 2 * REST_SIZE };
+    char *buf = n_malloc(BUFSIZE + GUARDSIZE), *rbuf;
+
+    voff0 = creat_with_vlen(path, 5);
+    /* the record as written, 0xffffffff, and one byte past the last offset */
+    uint32_t lens[] = { 5, UINT32_MAX, UINT32_MAX - voff0 + 1 };
+    for (unsigned i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+        int found = lens[i] == 5;
+
+        creat_with_vlen(path, lens[i]);
+        db = tndb_open(path);
+        expect_notnull(db);
+
+        memset(buf, 'g', BUFSIZE + GUARDSIZE);
+        expect_int(tndb_it_start(db, &it), 1);
+        vlen = BUFSIZE;
+        expect_int(tndb_it_get(&it, key, &klen, buf, &vlen), found);
+        if (found)
+            expect_str(buf, "value");
+        for (int j = BUFSIZE; j < BUFSIZE + GUARDSIZE; j++)
+            fail_unless(buf[j] == 'g', "tndb_it_get() wrote past the buffer at %d", j);
+
+        /* same block, so a write past the given size stays in it */
+        memset(buf, 'g', BUFSIZE + GUARDSIZE);
+        expect_int(tndb_it_start(db, &it), 1);
+        rbuf = buf;
+        vlen = BUFSIZE;
+        expect_int(tndb_it_rget(&it, key, &klen, (void **)&rbuf, &vlen), found);
+        fail_unless(rbuf == buf, "tndb_it_rget() reallocated the buffer");
+        if (found)
+            expect_str(buf, "value");
+        for (int j = BUFSIZE; j < BUFSIZE + GUARDSIZE; j++)
+            fail_unless(buf[j] == 'g', "tndb_it_rget() wrote past the buffer at %d", j);
+
+        expect_int(tndb_it_start(db, &it), 1);
+        expect_int(tndb_it_get_begin(&it, key, &klen, &vlen), found);
+        if (found)
+            expect_int(tndb_it_get_end(&it), 1);
+
+        /* the iterator stays on the broken record, not inside it */
+        expect_int(tndb_it_start(db, &it), 1);
+        expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), found);
+        expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), found);
+
+        expect_int(tndb_close(db), 1);
+    }
+    free(buf);
+    unlink(path);
+}
+END_TEST
+
+/* "a" ends where the record after it has its offsets past the last one */
+START_TEST(test_iterator_header_past_offsets)
+{
+    char *path = NTEST_TMPPATH("tndb_hdr_it.db");
+    char key[TNDB_KEY_MAX + 1];
+    unsigned int klen, vlen;
+    uint32_t voff, voff0;
+    struct tndb_it it;
+    struct tndb *db;
+
+    voff0 = creat_with_vlen(path, 5);
+    for (unsigned k = 0; k < sizeof(hdr_offs) / sizeof(hdr_offs[0]); k++) {
+        creat_with_vlen(path, hdr_offs[k] - voff0);
+        if (!extend_with_record_at(path, hdr_offs[k]))
+            return;
+
+        db = tndb_open(path);
+        expect_notnull(db);
+        expect_int(tndb_it_start(db, &it), 1);
+        expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), 1);
+        expect_int(voff, voff0);
+        expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), 0);
+        expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), 0);
+        expect_int(tndb_close(db), 1);
+    }
+    unlink(path);
+}
+END_TEST
+
 NTEST_RUNNER("tndb-lookup",
              test_get_all,
              test_get_str,
@@ -380,5 +643,9 @@ NTEST_RUNNER("tndb-lookup",
              test_iterator_rget,
              test_iterator_get,
              test_get_voff,
-             test_iterator_empty_value
+             test_iterator_empty_value,
+             test_lookup_value_past_offsets,
+             test_lookup_header_past_offsets,
+             test_iterator_value_past_offsets,
+             test_iterator_header_past_offsets
 );

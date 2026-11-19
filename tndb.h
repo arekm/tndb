@@ -81,6 +81,8 @@ EXPORT size_t tndb_get_all(struct tndb *db, const void *key, size_t klen,
 EXPORT int tndb_get_str(struct tndb *db, const char *key,
 			unsigned char *val, unsigned int valsize);
 
+/* 1 if found, 0 if not, -1 for a record that cannot be read or that ends
+   past the 32-bit offsets of the file */
 EXPORT int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
 			 uint32_t *voffs, unsigned int *vlen);
 
@@ -112,7 +114,8 @@ EXPORT int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
 EXPORT int tndb_it_rget(struct tndb_it *it, void *key, unsigned int *klen,
 	                void **val, unsigned int *vlen);
 
-/* 1 for a record, 0 after the last one or when it cannot be read */
+/* 1 for a record; 0 after the last one, and for a record that cannot be
+   read or that ends past the 32-bit offsets of the file */
 EXPORT int tndb_it_get_voff(struct tndb_it *it, void *key, unsigned int *klen,
                 	    uint32_t *voff, unsigned int *vlen);
 
