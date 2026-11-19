@@ -85,6 +85,7 @@ int do_walk(const char *name, unsigned flags)
                 fprintf(stderr, "%s: %m\n", name);
                 return -1;
             }
+            buf[vlen] = '\0';
 
             for (i=0; i < (int)vlen; i++)
                 if (!isprint(buf[i]))
