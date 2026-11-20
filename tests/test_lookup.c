@@ -381,8 +381,7 @@ static void returning_die_hook(const char *msg)
     die_calls++;
 }
 
-/* a reader called after it returned -1 calls n_die(); with a die hook
-   that returns, it returns -1 again */
+/* a reader called after it returned -1 returns 0, with an empty key */
 static void expect_dead(struct tndb_it *it)
 {
     char key[TNDB_KEY_MAX + 1];
@@ -393,10 +392,16 @@ static void expect_dead(struct tndb_it *it)
 
     old_hook = n_die_set_hook(returning_die_hook);
     die_calls = 0;
+    key[0] = 'k';
+    voff = vlen = 7;
     rc = tndb_it_get_voff(it, key, &klen, &voff, &vlen);
     n_die_set_hook(old_hook);
-    expect_int(rc, -1);
-    expect_int(die_calls, 1);
+    expect_int(rc, 0);
+    expect_int(die_calls, 0);
+    expect_int(klen, 0);
+    expect_str(key, "");
+    expect_int(voff, 0);
+    expect_int(vlen, 0);
 }
 
 /* A record is a key length, the key, a 32-bit value length and the value;
@@ -679,9 +684,18 @@ START_TEST(test_iterator_value_past_offsets)
         fail_unless(j < 0, "tndb_it_rget() wrote past the buffer at %d", j);
 
         expect_int(tndb_it_start(db, &it), 1);
+        vlen = 7;
         expect_int(tndb_it_get_begin(&it, key, &klen, &vlen), rc);
-        if (found)
+        if (found) {
+            expect_int(vlen, 5);
             expect_int(tndb_it_get_end(&it), 1);
+        } else {
+            /* a caller that takes -1 for a record and calls
+               tndb_it_get_end() gets 0, as for a value cut short */
+            expect_int(vlen, 0);
+            expect_int(tndb_it_get_end(&it), 0);
+            expect_dead(&it);
+        }
 
         expect_int(tndb_it_start(db, &it), 1);
         expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), rc);
@@ -724,6 +738,9 @@ START_TEST(test_iterator_header_past_offsets)
         expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), 1);
         expect_int(voff, voff0);
         expect_int(tndb_it_get_voff(&it, key, &klen, &voff, &vlen), -1);
+        /* the voff and vlen of the record before are not left behind */
+        expect_int(voff, 0);
+        expect_int(vlen, 0);
         expect_dead(&it);
         expect_null(tndb_keys(db));
         expect_int(tndb_close(db), 1);
@@ -759,6 +776,7 @@ START_TEST(test_iterator_get_end_skip)
     for (n = 0; (rc = tndb_it_get_begin(&it, key, &klen, &vlen)) > 0; n++)
         expect_int(tndb_it_get_end(&it), 1);
     expect_int(rc, 0);
+    expect_int(vlen, 0);        /* not the 6 of "c" */
     expect_int(n, 3);
     expect_int(tndb_close(db), 1);
 
@@ -923,7 +941,9 @@ START_TEST(test_iterator_get_small_buffer)
     expect_int(rc, -1);
     expect_int(errno, ERANGE);
     expect_int(die_calls, 0);
-    expect_int(vlen, 8);
+    expect_int(vlen, 0);
+    expect_str(buf, "");
+    expect_str(key, "");
     expect_dead(&it);
 
     expect_int(tndb_close(db), 1);
@@ -969,18 +989,76 @@ START_TEST(test_iterator_get_small_buffer_untouched)
     rc = tndb_it_get(&it, key, &klen, b.buf, &vlen);
     expect_int(rc, -1);
     expect_int(errno, ERANGE);
-    expect_int(vlen, sizeof(b.buf));    /* the size is not grown */
+    expect_int(vlen, 0);                /* the size is not grown */
+    expect_int(b.buf[0], '\0');         /* an empty value */
+    b.buf[0] = 'g';
 
-    /* the iteration stopped: the next call is the dead one */
+    /* the iteration stopped: the next call ends it */
+    vlen = sizeof(b.buf);
     rc = tndb_it_get(&it, key, &klen, b.buf, &vlen);
     n_die_set_hook(old_hook);
-    expect_int(rc, -1);
-    expect_int(die_calls, 1);
+    expect_int(rc, 0);
+    expect_int(die_calls, 0);
 
     for (i = 0; i < (int)sizeof(b); i++)
         fail_unless(((const unsigned char *)&b)[i] == 'g',
                     "tndb_it_get() wrote into the buffer at %d", i);
 
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+END_TEST
+
+/* the loops of poldek test the result for truth and use what the reader
+   left behind; a value cut short gives them an empty record, then 0 */
+START_TEST(test_iterator_truth_test_caller)
+{
+    char *path = NTEST_TMPPATH("tndb_it_truth.db");
+    char key[TNDB_KEY_MAX + 1];
+    unsigned int klen, vlen, vlen_max;
+    uint32_t cvoff;
+    t_fn_die_hook old_hook;
+    struct tndb *db;
+    struct tndb_it it;
+    char *val;
+    int n, empty;
+
+    unlink(path);
+    db = tndb_creat(path, -1, 0);
+    expect_notnull(db);
+    expect_int(tndb_put(db, "_1a", 3, "/usr/bin", 8), 1);
+    expect_int(tndb_put(db, "_1b", 3, "/usr/share/doc/b", 16), 1);
+    expect_int(tndb_close(db), 1);
+    db = tndb_open(path);
+    expect_int(tndb_get_voff(db, "_1b", 3, &cvoff, &vlen), 1);
+    expect_int(tndb_close(db), 1);
+    expect_int(truncate(path, cvoff + 3), 0);
+
+    db = tndb_open(path);
+    expect_notnull(db);
+    expect_int(tndb_it_start(db, &it), 1);
+    memset(key, 'k', sizeof(key));      /* no '\0' from an earlier record */
+    vlen = vlen_max = 8;
+    val = n_malloc(vlen);
+    memset(val, 'v', vlen);
+    n = empty = 0;
+    old_hook = n_die_set_hook(returning_die_hook);
+    while (tndb_it_rget(&it, key, &klen, (void **)&val, &vlen)) {
+        fail_unless(n++ < 3, "the loop does not end");
+        val[vlen] = '\0';               /* pkgdir_dirindex.c does this */
+        fail_unless(klen == strlen(key), "klen %u, key %zu", klen, strlen(key));
+        fail_unless(vlen == strlen(val), "vlen %u, val %zu", vlen, strlen(val));
+        if (klen == 0 && vlen == 0)
+            empty++;
+        if (vlen < vlen_max)
+            vlen = vlen_max;
+        else
+            vlen_max = vlen;
+    }
+    n_die_set_hook(old_hook);
+    expect_int(n, 2);                   /* "_1a" and the empty one */
+    expect_int(empty, 1);
+    free(val);
     expect_int(tndb_close(db), 1);
     unlink(path);
 }
@@ -1003,5 +1081,6 @@ NTEST_RUNNER("tndb-lookup",
              test_iterator_get_end_skip,
              test_iterator_end,
              test_iterator_get_small_buffer,
-             test_iterator_get_small_buffer_untouched
+             test_iterator_get_small_buffer_untouched,
+             test_iterator_truth_test_caller
 );

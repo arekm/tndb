@@ -685,37 +685,45 @@ int tndb_it_start(struct tndb *db, struct tndb_it *it)
 }
 
 
-/* a reader called again after it returned -1 for a broken record: a caller
-   that tests the result for truth would otherwise read it over and over */
-static int it_dead(const struct tndb_it *it)
-{
-    if (it->_state != IT_BROKEN)
-        return 0;
-
-    n_die("tndb: %s: a reader called after it returned -1\n",
-          tndb_path(it->_db));
-    errno = EBADMSG;
-    return 1;
-}
-
-static int it_broken(struct tndb_it *it)
+static int it_broken(struct tndb_it *it, int err)
 {
     it->_state = IT_BROKEN;
-    errno = EBADMSG;
+    errno = err;
     return -1;
+}
+
+/* -1 leaves an empty key behind, not what the failed read left in it: a
+   caller that tests the result for truth takes it for a record */
+static int it_broken_key(struct tndb_it *it, int err, void *key, unsigned int *klen)
+{
+    if (key)
+        ((unsigned char *)key)[0] = '\0';
+
+    if (klen)
+        *klen = 0;
+
+    return it_broken(it, err);
+}
+
+/* and an empty value; size is what the buffer holds */
+static void clear_val(void *val, size_t size, unsigned int *avlen)
+{
+    if (val != NULL && size > 0)
+        ((char *)val)[0] = '\0';
+    *avlen = 0;
 }
 
 /* after the last record: the last value ends the data, and a read of it
    leaves the stream there; a value only skipped is checked (a backward
    seek of a compressed stream reads it again from its start) */
-static int it_end(struct tndb_it *it)
+static int it_end(struct tndb_it *it, void *key, unsigned int *klen)
 {
     long pos = n_stream_tell(it->_db->st);
 
     if ((pos >= 0 && (uint64_t)pos == it->_off) || skip_to(it->_db->st, it->_off))
         return 0;
 
-    return it_broken(it);
+    return it_broken_key(it, EBADMSG, key, klen);
 }
 
 /*
@@ -729,21 +737,28 @@ int tndb_it_get_voff(struct tndb_it *it, void *key, unsigned int *klen,
     uint32_t vlen32 = 0;
     tn_stream *st;
 
-    if (it_dead(it))
-        return -1;
+    if (klen)
+        *klen = 0;
+    *voff = 0;
+    *vlen = 0;
+
+    /* -1 was returned once, the iteration is over: a loop that tests the
+       result for truth stops here */
+    if (it->_state == IT_BROKEN) {
+        if (key)
+            ((unsigned char *)key)[0] = '\0';
+        return 0;
+    }
 
     n_assert(it->_state == IT_NEXT);
 
-    if (key)
-        *klen = 0;
-
     if (it->_nrec == it->_db->hdr.nrec)
-        return it_end(it);
+        return it_end(it, key, klen);
 
     st = it->_db->st;
 
     if (nn_stream_read_offs(st, &db_klen, 1, it->_off) != 1)
-        return it_broken(it);
+        return it_broken_key(it, EBADMSG, key, klen);
 
     if (klen)
         *klen = db_klen;
@@ -751,14 +766,14 @@ int tndb_it_get_voff(struct tndb_it *it, void *key, unsigned int *klen,
     DBGF("get %d of %d\n", it->_nrec, it->_db->hdr.nrec);
     if (key) {
         if (n_stream_read(st, key, db_klen) != db_klen)
-            return it_broken(it);
+            return it_broken_key(it, EBADMSG, key, klen);
 
         ((unsigned char *)key)[db_klen] = '\0';
         DBGF("key[%d] %s(%d)\n", it->_off, (char *)key, db_klen);
     }
 
     if (!read_vlen(st, it->_off, db_klen, voff, &vlen32))
-        return it_broken(it);
+        return it_broken_key(it, EBADMSG, key, klen);
 
     DBGF("vlen of key %s = %d\n", key ? (char *)key : "(null)", vlen32);
 
@@ -777,19 +792,23 @@ int tndb_it_get(struct tndb_it *it, void *key, unsigned int *klen,
     unsigned int vlen;
     int          rc;
 
-    if ((rc = tndb_it_get_voff(it, key, klen, &voff, &vlen)) <= 0)
+    if ((rc = tndb_it_get_voff(it, key, klen, &voff, &vlen)) <= 0) {
+        if (rc < 0)
+            clear_val(val, *avlen, avlen);
         return rc;
+    }
 
     /* the length comes from the file: a value that does not fit is an
        error like any other, not a reason to end the program */
     if (vlen >= *avlen) {
-        it_broken(it);
-        errno = ERANGE;
-        return -1;
+        clear_val(val, *avlen, avlen);
+        return it_broken_key(it, ERANGE, key, klen);
     }
 
-    if (n_stream_read(it->_db->st, val, vlen) != (int)vlen)
-        return it_broken(it);
+    if (n_stream_read(it->_db->st, val, vlen) != (int)vlen) {
+        clear_val(val, *avlen, avlen);
+        return it_broken_key(it, EBADMSG, key, klen);
+    }
 
     ((char*)val)[vlen] = '\0';
     *avlen = vlen;
@@ -801,20 +820,27 @@ int tndb_it_rget(struct tndb_it *it, void *key, unsigned int *klen,
 {
     uint32_t     voff;
     unsigned int vlen;
+    size_t       size = *avlen;
     int          rc;
 
 
-    if ((rc = tndb_it_get_voff(it, key, klen, &voff, &vlen)) <= 0)
+    if ((rc = tndb_it_get_voff(it, key, klen, &voff, &vlen)) <= 0) {
+        if (rc < 0)
+            clear_val(*val, size, avlen);
         return rc;
+    }
 
     DBGF("%s avlen %d\n", key ? (char *)key : "(null)", *avlen);
     if (vlen >= *avlen) {
         DBGF("realloc avlen=%d, vlen=%d\n", *avlen, vlen);
-        *val = n_realloc(*val, (size_t)vlen + 1);
+        size = (size_t)vlen + 1;
+        *val = n_realloc(*val, size);
     }
 
-    if (n_stream_read(it->_db->st, *val, vlen) != (int)vlen)
-        return it_broken(it);
+    if (n_stream_read(it->_db->st, *val, vlen) != (int)vlen) {
+        clear_val(*val, size, avlen);
+        return it_broken_key(it, EBADMSG, key, klen);
+    }
 
     ((char*)*val)[vlen] = '\0';
     *avlen = vlen;
@@ -828,33 +854,41 @@ int tndb_it_get_begin(struct tndb_it *it, void *key, unsigned int *klen,
     unsigned int vlen = 0;
     int          rc;
 
-    if ((rc = tndb_it_get_voff(it, key, klen, &voff, &vlen)) <= 0)
+    rc = tndb_it_get_voff(it, key, klen, &voff, &vlen);
+
+    /* 0 unless rc is 1: tndb_it_get_voff() zeroes vlen */
+    if (avlen)
+        *avlen = vlen;
+
+    if (rc <= 0)
         return rc;
 
     n_stream_seek(it->_db->st, voff, SEEK_SET);
     it->_state = IT_IN_VALUE;
-
-    if (avlen)
-        *avlen = vlen;
     //printf("tndb_it_get_begin %lu + %lu => %lu\n", voff, vlen, it->_off);
     return 1;
 }
 
 int tndb_it_get_end(struct tndb_it *it)
 {
-    uint32_t off = n_stream_tell(it->_db->st);
+    uint32_t off;
+
+    /* after a -1 of tndb_it_get_begin(), for a caller that took it for 1 */
+    if (it->_state == IT_BROKEN)
+        return 0;
 
     n_assert(it->_state == IT_IN_VALUE);
+    off = n_stream_tell(it->_db->st);
 
     if (off > it->_off) {
         n_die("tndb_it_get_end: current offset is %u, expected %u\n", off,
                it->_off);
-        it_broken(it);
+        it_broken(it, EBADMSG);
         return 0;
     }
 
     if (off < it->_off && !skip_to(it->_db->st, it->_off)) {
-        it_broken(it);
+        it_broken(it, EBADMSG);
         return 0;
     }
 

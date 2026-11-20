@@ -105,7 +105,10 @@ EXPORT int tndb_it_start(struct tndb *db, struct tndb_it *it);
 
 /*
   readers: 1 for a record, 0 at the end, -1 for a broken record (EBADMSG);
-  -1 ends the iteration, a reader called after it calls n_die()
+  -1 ends the iteration, a reader called after it returns 0; with -1 the
+  key, and the value of tndb_it_get() and tndb_it_rget(), are empty
+  (*klen and *vlen are 0, *voff of tndb_it_get_voff() too), so the broken
+  record is named by the one before it
  */
 
 /*
