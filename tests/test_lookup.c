@@ -799,6 +799,56 @@ START_TEST(test_iterator_get_end_skip)
 }
 END_TEST
 
+/* a caller that read past the value has lost its place: tndb_it_get_end()
+   reports it with n_die() and, when the die hook returns, the iteration
+   stops (the next tndb_it_get_begin() hit its n_assert() there) */
+START_TEST(test_iterator_get_end_past_value)
+{
+    char *path = NTEST_TMPPATH("tndb_it_getend_past.db");
+    char key[TNDB_KEY_MAX + 1], buf[16];
+    unsigned int klen, vlen;
+    t_fn_die_hook old_hook;
+    struct tndb_it it;
+    struct tndb *db;
+    tn_stream *st;
+    int rc;
+
+    unlink(path);
+    db = tndb_creat(path, -1, 0);
+    expect_notnull(db);
+    expect_int(tndb_put(db, "a", 1, "value", 5), 1);
+    expect_int(tndb_put(db, "b", 1, "bvalue", 6), 1);
+    expect_int(tndb_close(db), 1);
+
+    db = tndb_open(path);
+    expect_notnull(db);
+    st = tndb_tn_stream(db);
+    expect_int(tndb_it_start(db, &it), 1);
+    expect_int(tndb_it_get_begin(&it, key, &klen, &vlen), 1);
+    expect_str(key, "a");
+    expect_int(n_stream_read(st, buf, vlen + 1), (int)vlen + 1);
+
+    old_hook = n_die_set_hook(returning_die_hook);
+    die_calls = 0;
+    errno = 0;
+    rc = tndb_it_get_end(&it);
+    n_die_set_hook(old_hook);
+    expect_int(rc, 0);
+    expect_int(die_calls, 1);
+    expect_int(errno, EBADMSG);
+
+    /* not "b": the iteration is over */
+    vlen = 7;
+    expect_int(tndb_it_get_begin(&it, key, &klen, &vlen), 0);
+    expect_str(key, "");
+    expect_int(klen, 0);
+    expect_int(vlen, 0);
+    expect_dead(&it);
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+END_TEST
+
 /* 0 only for a database read to its end: a reader that cannot read a
    record of a file cut short returns -1, which stops the iteration */
 START_TEST(test_iterator_end)
@@ -1079,6 +1129,7 @@ NTEST_RUNNER("tndb-lookup",
              test_iterator_value_past_offsets,
              test_iterator_header_past_offsets,
              test_iterator_get_end_skip,
+             test_iterator_get_end_past_value,
              test_iterator_end,
              test_iterator_get_small_buffer,
              test_iterator_get_small_buffer_untouched,
