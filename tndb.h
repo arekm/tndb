@@ -57,6 +57,9 @@ EXPORT int tndb_close(struct tndb *db);
 /* unlinks && _closes_ db */
 EXPORT int tndb_unlink(struct tndb *db);
 
+/* for a signed database the answer is remembered for the handle: one that
+   fails stays broken for the lookups after it, until tndb_verify() is called
+   again; without a digest the lookups do not depend on it */
 EXPORT int tndb_verify(struct tndb *db);
 
 EXPORT struct tndb *tndb_ref(struct tndb *db);

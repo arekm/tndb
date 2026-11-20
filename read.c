@@ -40,8 +40,11 @@ static inline int verify_db(struct tndb *db)
     if (db->rtflags & TNDB_R_SIGN_VRFIED)
         return 1;
 
+    if (db->rtflags & TNDB_R_SIGN_BROKEN)     /* asked before */
+        return 0;
+
     if (db->hdr.flags & TNDB_SIGNED)
-        return tndb_verify(db);
+        return tndb_verify(db);               /* records the answer */
 
     n_assert(0);
     db->rtflags |= TNDB_R_SIGN_VRFIED;
@@ -466,8 +469,15 @@ int tndb_verify(struct tndb *db)
         rc = 1;
     }
 
-    if (rc)
+    if (rc) {
         db->rtflags |= TNDB_R_SIGN_VRFIED;
+        db->rtflags &= ~TNDB_R_SIGN_BROKEN;
+
+    } else if (db->hdr.flags & TNDB_SIGNED) {
+        /* only these are checked by a lookup */
+        db->rtflags &= ~TNDB_R_SIGN_VRFIED;
+        db->rtflags |= TNDB_R_SIGN_BROKEN;
+    }
 
     return rc;
 }
