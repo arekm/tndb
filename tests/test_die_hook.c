@@ -286,6 +286,42 @@ START_TEST(test_get_hash_table_size_max)
 }
 END_TEST
 
+/* a key too long is the caller's error, reported before the tables are read
+   for it: the broken file is still reported by the next lookup, once */
+START_TEST(test_get_key_too_long_broken)
+{
+    char *path = NTEST_TMPPATH("tndb_die_keybroken.db");
+    char key[CUT_TO_A];
+    uint32_t entry, table, voff;
+    struct tndb *db;
+    unsigned int vlen;
+
+    creat_with_tables(path, &entry, &table, NULL);
+    write_be32(path, entry, 0xffffff00);   /* past the end of the file */
+    memset(key, 'a', sizeof(key));
+
+    set_returning_die_hook();
+    db = tndb_open(path);
+    expect_notnull(db);
+
+    expect_int(tndb_get_voff(db, key, sizeof(key), &voff, &vlen), -1);
+    expect_int(ndies, 1);
+    fail_unless(strstr(die_msg, "key too long") != NULL, "got '%s'", die_msg);
+
+    /* the tables were not read for it: this lookup reports the file */
+    expect_int(tndb_get_voff(db, "key00", 5, &voff, &vlen), -1);
+    expect_int(ndies, 2);
+    fail_unless(strstr(die_msg, "htt_read failed") != NULL, "got '%s'", die_msg);
+
+    /* and that one is reported once */
+    expect_int(tndb_get_voff(db, "key00", 5, &voff, &vlen), -1);
+    expect_int(ndies, 2);
+
+    expect_int(tndb_close(db), 1);
+    unlink(path);
+}
+END_TEST
+
 /* the header's doffs, and nrec when set_nrec, set past anything the file can
    have, and the size of a table from the second half: the lookup is to fail,
    under a memory limit that an array of the size from the file breaks */
@@ -359,5 +395,6 @@ NTEST_RUNNER("tndb-die-hook",
              test_get_hash_table_size_0,
              test_get_hash_table_size_too_large,
              test_get_hash_table_size_max,
+             test_get_key_too_long_broken,
              test_get_hash_table_size_from_header,
              test_get_hash_table_sizes_past_nrec);

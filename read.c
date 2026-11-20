@@ -530,6 +530,12 @@ int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
     *voffs = 0;
     *vlen = 0;
 
+    /* the caller's key, before the tables are read for it */
+    if (aklen > UINT8_MAX) {
+        n_die("tndb: key too long (max is %d)\n", UINT8_MAX);
+        return -1;
+    }
+
     if (!verify_db(db))
         return -1;
 
@@ -537,7 +543,6 @@ int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
         n_die("tndb: method not allowed on file without hash table\n");
         return -1;
     }
-
 
     if ((db->rtflags & TNDB_R_HTT_LOADED) == 0) {
         if (db->rtflags & TNDB_R_HTT_BROKEN)     /* reported once, not read again */
@@ -551,11 +556,6 @@ int tndb_get_voff(struct tndb *db, const void *key, unsigned int aklen,
         }
         //printf("tndb: %p, htt_read OK\n", db);
         db->rtflags |= TNDB_R_HTT_LOADED;
-    }
-
-    if (aklen > UINT8_MAX) {
-        n_die("tndb: key too long (max is %d)\n", UINT8_MAX);
-        return -1;
     }
 
     klen = aklen;
