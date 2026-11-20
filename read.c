@@ -238,10 +238,14 @@ int read_eq(const struct tndb *db, const uint32_t offs,
     return memcmp(buf, str, len) == 0;
 }
 
+/* the size of a hash table comes from the file: its array starts this small
+   and n_array_push() grows it as the entries are read */
+#define HT_INIT_SIZE 1024
+
 static int htt_read(struct tndb *db)
 {
     int i, j;
-    uint32_t ht_offsets[TNDB_HTSIZE], nleft;
+    uint32_t ht_offsets[TNDB_HTSIZE], nleft, nrec_left;
 
     /* read ht entries offsets first to avoid backward file seek */
 
@@ -264,6 +268,8 @@ static int htt_read(struct tndb *db)
         return 0;
     nleft = (db->hdr.doffs - db->offs.htt - 2 * TNDB_HTBYTESIZE) /
         (2 * sizeof(uint32_t));
+    /* and a record has one entry */
+    nrec_left = db->hdr.nrec;
 
     for (i=0; i < TNDB_HTSIZE; i++) {
         tn_array *ht = db->htt[i];
@@ -278,15 +284,20 @@ static int htt_read(struct tndb *db)
             return 0;
 
         /* tndb points at no table of size 0: a file that does, or that
-           has more entries than room for them, is broken */
-        if (ht_size == 0 || ht_size > nleft) {
-            DBGF("table %d: size %u, room for %u\n", i, ht_size, nleft);
+           has more entries than room for them, or more than records, is
+           broken */
+        if (ht_size == 0 || ht_size > nleft || ht_size > nrec_left) {
+            DBGF("table %d: size %u, room for %u, records left %u\n", i,
+                 ht_size, nleft, nrec_left);
             return 0;
         }
         nleft -= ht_size;
+        nrec_left -= ht_size;
 
         if (ht == NULL) {
-            ht = n_array_new(ht_size, tndb_hent_free, (tn_fn_cmp)tndb_hent_cmp);
+            /* the size is the file's: do not allocate it up front */
+            ht = n_array_new(ht_size < HT_INIT_SIZE ? ht_size : HT_INIT_SIZE,
+                             tndb_hent_free, (tn_fn_cmp)tndb_hent_cmp);
             db->htt[i] = ht;
         }
 

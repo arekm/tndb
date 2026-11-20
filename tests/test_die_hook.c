@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <trurl/n_check.h>
@@ -127,10 +128,11 @@ END_TEST
 #define NREC 64
 
 /* NREC keys "key00".. with the value "value"; then where the offset of a
-   hash table from the second half is kept, and where that table is. The
-   offsets of the 256 hash tables follow the header, then each table takes
-   4 bytes and each record 8 more, up to the data. */
-static void creat_with_tables(const char *path, uint32_t *entry, uint32_t *table)
+   hash table from the second half is kept, where that table is, and where
+   the offsets of the 256 hash tables are: they follow the header, then each
+   table takes 4 bytes and each record 8 more, up to the data. */
+static void creat_with_tables(const char *path, uint32_t *entry, uint32_t *table,
+                              uint32_t *htt_offs)
 {
     unsigned char offs[256 * 4];
     struct tndb_it it;
@@ -175,6 +177,8 @@ static void creat_with_tables(const char *path, uint32_t *entry, uint32_t *table
         if (i >= 128) {
             *entry = htt + 4 * i;
             *table = off;
+            if (htt_offs)
+                *htt_offs = htt;
             return;
         }
     }
@@ -220,7 +224,7 @@ START_TEST(test_get_hash_table_broken)
     struct tndb *db;
     int nfound, nfailed;
 
-    creat_with_tables(path, &entry, &table);
+    creat_with_tables(path, &entry, &table, NULL);
     write_be32(path, entry, 0xffffff00);   /* past the end of the file */
 
     set_returning_die_hook();
@@ -244,7 +248,7 @@ static void check_table_size(const char *path, uint32_t size)
     struct tndb *db;
     int nfound, nfailed;
 
-    creat_with_tables(path, &entry, &table);
+    creat_with_tables(path, &entry, &table, NULL);
     write_be32(path, table, size);
 
     set_returning_die_hook();
@@ -281,6 +285,71 @@ START_TEST(test_get_hash_table_size_max)
 }
 END_TEST
 
+/* the header's doffs, and nrec when set_nrec, set past anything the file can
+   have, and the size of a table from the second half: the lookup is to fail,
+   under a memory limit that an array of the size from the file breaks */
+static void check_header_table_size(const char *path, int set_nrec,
+                                    uint32_t size)
+{
+    struct rlimit old, lim;
+    uint32_t entry, table, htt, voff;
+    struct tndb *db;
+    unsigned int vlen;
+    int have_lim, ndies1, rc, closed;
+
+    creat_with_tables(path, &entry, &table, &htt);
+
+    /* the header ends with the timestamp, nrec and doffs */
+    write_be32(path, htt - 4, 0xffffffff);
+    if (set_nrec)
+        write_be32(path, htt - 8, 0xffffffff);
+    write_be32(path, table, size);
+
+    set_returning_die_hook();
+    db = tndb_open(path);
+    expect_notnull(db);
+
+    have_lim = getrlimit(RLIMIT_AS, &old) == 0;
+    if (have_lim) {
+        lim = old;
+        lim.rlim_cur = 256 * 1024 * 1024;
+        if (lim.rlim_max != RLIM_INFINITY && lim.rlim_cur > lim.rlim_max)
+            lim.rlim_cur = lim.rlim_max;
+        have_lim = setrlimit(RLIMIT_AS, &lim) == 0;
+    }
+
+    rc = tndb_get_voff(db, "key00", 5, &voff, &vlen);
+    ndies1 = ndies;
+    closed = tndb_close(db);
+    if (have_lim)
+        setrlimit(RLIMIT_AS, &old);
+
+    fail_unless(rc == -1, "nrec %s, size %u: %d", set_nrec ? "set" : "kept",
+                size, rc);
+    expect_int(ndies1, 1);
+    fail_unless(strstr(die_msg, "htt_read failed") != NULL, "got '%s'", die_msg);
+    expect_int(closed, 1);
+    unlink(path);
+}
+
+/* the room for entries comes from doffs and the number of records from
+   nrec, both from the header: with both past anything the file can have, a
+   size of 500000000 entries is not allocated (4 GB) before they are read */
+START_TEST(test_get_hash_table_size_from_header)
+{
+    check_header_table_size(NTEST_TMPPATH("tndb_die_htsizehdr.db"), 1,
+                            500000000);
+}
+END_TEST
+
+/* with doffs alone past them, nrec bounds the tables together: one of NREC
+   entries leaves no room for the tables before it */
+START_TEST(test_get_hash_table_sizes_past_nrec)
+{
+    check_header_table_size(NTEST_TMPPATH("tndb_die_htsizenrec.db"), 0, NREC);
+}
+END_TEST
+
 NTEST_RUNNER("tndb-die-hook",
              test_get_key_too_long,
              test_put_key_too_long,
@@ -288,4 +357,6 @@ NTEST_RUNNER("tndb-die-hook",
              test_get_hash_table_broken,
              test_get_hash_table_size_0,
              test_get_hash_table_size_too_large,
-             test_get_hash_table_size_max);
+             test_get_hash_table_size_max,
+             test_get_hash_table_size_from_header,
+             test_get_hash_table_sizes_past_nrec);
