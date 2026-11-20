@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/time.h>
 
 
@@ -50,7 +51,8 @@ int do_walk(const char *name, unsigned flags)
     struct tndb     *db;
     struct tndb_it  it;
     char            key[TNDB_KEY_MAX + 1];
-    int             rc;
+    char            last[TNDB_KEY_MAX + 1] = "";
+    int             rc, nrec = 0;
     unsigned int    kn;
 
     if ((db = tndb_open(name)) == NULL) {
@@ -70,6 +72,7 @@ int do_walk(const char *name, unsigned flags)
     }
 
     while ((rc = tndb_it_get_voff(&it, key, &kn, &voffs, &vlen)) > 0) {
+        nrec++;
         printf("KEY = %s\n", key);
         if (flags & DUMP_DATA) {
             unsigned char *buf;
@@ -100,10 +103,20 @@ int do_walk(const char *name, unsigned flags)
 
             printf("DATA = %s\n\n--------------------------------------------------\n", buf);
         }
+
+        /* -1 leaves the key empty: the record before names the place */
+        memcpy(last, key, kn + 1);
     }
 
     if (rc < 0) {
-        fprintf(stderr, "%s: tndb_it_get_voff failed\n", name);
+        /* the failed record has no key: name its number, where it is and
+           the one before; the first is named, so no number is read as 0 */
+        if (nrec > 0)
+            fprintf(stderr, "%s: record %d is broken at offset %u (after \"%s\"): %m\n",
+                    name, nrec + 1, it._off, last);
+        else
+            fprintf(stderr, "%s: the first record is broken at offset %u: %m\n",
+                    name, it._off);
         return -1;
     }
     return 0;
