@@ -215,8 +215,8 @@ static void get_keys(struct tndb *db, int *nfound, int *nfailed)
     }
 }
 
-/* a hash table that cannot be read in full is not used in part: each
-   lookup reports it and fails */
+/* a hash table that cannot be read in full is not used in part: the first
+   lookup reports it and every one fails */
 START_TEST(test_get_hash_table_broken)
 {
     char *path = NTEST_TMPPATH("tndb_die_htbroken.db");
@@ -233,15 +233,16 @@ START_TEST(test_get_hash_table_broken)
     get_keys(db, &nfound, &nfailed);
     expect_int(nfound, 0);
     expect_int(nfailed, NREC);
-    expect_int(ndies, NREC);
+    expect_int(ndies, 1);
     fail_unless(strstr(die_msg, "htt_read failed") != NULL, "got '%s'", die_msg);
+    fail_unless(strstr(die_msg, path) != NULL, "no file name: '%s'", die_msg);
     expect_int(tndb_close(db), 1);
     unlink(path);
 }
 END_TEST
 
-/* the size of a hash table from the second half set in the file; each
-   lookup is to report the file broken and fail */
+/* the size of a hash table from the second half set in the file; the first
+   lookup is to report the file broken and all of them to fail */
 static void check_table_size(const char *path, uint32_t size)
 {
     uint32_t entry, table;
@@ -255,7 +256,7 @@ static void check_table_size(const char *path, uint32_t size)
     db = tndb_open(path);
     expect_notnull(db);
     get_keys(db, &nfound, &nfailed);
-    fail_unless(nfound == 0 && nfailed == NREC && ndies == NREC,
+    fail_unless(nfound == 0 && nfailed == NREC && ndies == 1,
                 "size %u: %d found, %d failed, %d messages",
                 size, nfound, nfailed, ndies);
     fail_unless(strstr(die_msg, "htt_read failed") != NULL, "got '%s'", die_msg);
